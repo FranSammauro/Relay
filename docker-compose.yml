@@ -37,6 +37,7 @@ services:
       dockerfile: Dockerfile.worker
     environment:
       DATABASE_URL: postgres://queue:queue@postgres:5432/queue
+      CONCURRENCY: 4
       RUST_LOG: info
     depends_on:
       postgres:
@@ -44,7 +45,9 @@ services:
       api:
         condition: service_started
     deploy:
-      replicas: 1
+      # Fase 2: varios workers compitiendo de verdad por trabajo via
+      # SKIP LOCKED. Subilo o bajalo con `docker compose up --scale worker=N`.
+      replicas: 3
 
 volumes:
   pgdata:

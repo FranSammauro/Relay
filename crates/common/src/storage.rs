@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::QueueError;
-use crate::model::{Job, JobRow, NewJob};
+use crate::model::{Job, JobRow, NewJob, StatusCount};
 
 /// Storage es la única puerta de entrada a PostgreSQL, que actúa como fuente
 /// de verdad para el estado persistente del sistema (ADR-001).
@@ -206,5 +206,42 @@ impl Storage {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Registra un worker al arrancar. Es upsert porque si reiniciás un
+    /// worker con el mismo WORKER_ID (por ejemplo en un redeploy), no tiene
+    /// sentido explotar por unique constraint -- simplemente actualiza
+    /// concurrency y started_at.
+    ///
+    /// Esto NO es el mecanismo de liveness (eso es Fase 4 con heartbeats de
+    /// verdad). Si el worker se cae de mala manera, la fila queda como
+    /// "último dato conocido" nomás.
+    pub async fn register_worker(&self, worker_id: &str, concurrency: i32) -> Result<(), QueueError> {
+        sqlx::query(
+            r#"
+            INSERT INTO workers (id, concurrency, started_at)
+            VALUES ($1, $2, now())
+            ON CONFLICT (id) DO UPDATE
+                SET concurrency = EXCLUDED.concurrency,
+                    started_at = EXCLUDED.started_at
+            "#,
+        )
+        .bind(worker_id)
+        .bind(concurrency)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Cuenta jobs agrupados por estado. Sirve para el `queue_depth`
+    /// observable que pide la Fase 2 y como base cruda para las métricas
+    /// Prometheus que llegan en Fase 6.
+    pub async fn count_by_status(&self) -> Result<Vec<StatusCount>, QueueError> {
+        let rows = sqlx::query_as::<_, StatusCount>(
+            r#"SELECT status, COUNT(*) as count FROM jobs GROUP BY status"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 }

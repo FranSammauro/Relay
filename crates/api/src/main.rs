@@ -36,6 +36,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/jobs", get(handlers::list_jobs))
         .route("/jobs/:id", get(handlers::get_job))
         .route("/jobs/:id", delete(handlers::cancel_job))
+        .route("/stats", get(handlers::stats))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state);

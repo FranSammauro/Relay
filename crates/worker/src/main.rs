@@ -1,6 +1,8 @@
 mod handlers;
 
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
@@ -29,20 +31,55 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(500),
     );
 
-    tracing::info!(event = "worker_starting", worker_id = %worker_id, "starting worker");
+    // Cuantos jobs corre este worker en paralelo. Fijo por config en Fase 2 --
+    // nada de auto-scaling ni tuning dinámico todavía, eso sería resolver un
+    // problema que ni siquiera tenemos planteado bien.
+    let concurrency: usize = std::env::var("CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
 
-    // Fase 1: un único loop secuencial de claim -> execute -> ack.
-    // La ejecución concurrente de múltiples jobs por worker (tokio::spawn +
-    // semáforo de concurrency) se formaliza en Fase 2.
+    storage.register_worker(&worker_id, concurrency as i32).await?;
+
+    tracing::info!(
+        event = "worker_starting",
+        worker_id = %worker_id,
+        concurrency,
+        "starting worker"
+    );
+
+    // Fase 2: loop de claim que dispara ejecuciones en paralelo, con un
+    // semáforo como único freno de mano. La idea es simple a propósito:
+    // pedimos un permiso, reclamamos un job, lo largamos en su propia
+    // tarea, y seguimos pidiendo mientras haya permisos libres. El permiso
+    // se libera solo cuando el job termina (el `Arc<Semaphore>` clonado
+    // dentro de la tarea hace ese trabajo sucio).
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+
     loop {
+        // acquire_owned nos deja mover el permiso adentro del spawn sin
+        // pelearnos con lifetimes -- si no está disponible, se queda acá
+        // esperando, que es exactamente el comportamiento que queremos:
+        // no reclamar más trabajo del que podemos correr.
+        let permit = semaphore.clone().acquire_owned().await?;
+
         match storage.claim_next_job(&worker_id).await {
             Ok(Some(job)) => {
-                run_job(&storage, &worker_id, job).await;
+                let storage = storage.clone();
+                let worker_id = worker_id.clone();
+                tokio::spawn(async move {
+                    run_job(&storage, &worker_id, job).await;
+                    drop(permit);
+                });
             }
             Ok(None) => {
+                // no había nada para reclamar, devolvemos el permiso y
+                // esperamos el poll_interval como en Fase 1.
+                drop(permit);
                 tokio::time::sleep(poll_interval).await;
             }
             Err(e) => {
+                drop(permit);
                 tracing::error!(event = "claim_error", error = %e, "failed to claim job, backing off");
                 tokio::time::sleep(poll_interval * 2).await;
             }

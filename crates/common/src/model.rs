@@ -144,3 +144,19 @@ fn default_priority() -> i32 {
 fn default_max_attempts() -> i32 {
     5
 }
+
+/// Fila de la tabla `workers` (Fase 2: solo registro, sin heartbeat todavía).
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct WorkerInfo {
+    pub id: String,
+    pub concurrency: i32,
+    pub started_at: DateTime<Utc>,
+}
+
+/// Conteo de jobs agrupados por estado, para el endpoint de stats.
+/// No es Prometheus todavía (eso es Fase 6), pero da la misma info en JSON.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct StatusCount {
+    pub status: String,
+    pub count: i64,
+}

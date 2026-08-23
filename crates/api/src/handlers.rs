@@ -53,7 +53,7 @@ pub async fn ready(State(state): State<AppState>) -> Response {
 }
 
 #[derive(Debug, Serialize)]
-struct CreateJobResponse {
+pub struct CreateJobResponse {
     id: Uuid,
     status: String,
 }
@@ -127,4 +127,17 @@ pub async fn cancel_job(
     } else {
         Err(QueueError::InvalidState(id).into())
     }
+}
+
+/// Fase 2: conteo de jobs por estado, la versión cruda de `queue_depth`
+/// antes de que exista un endpoint /metrics en formato Prometheus (Fase 6).
+/// Sirve tal cual para el test de concurrencia y para mirar el estado del
+/// sistema a mano con un curl.
+pub async fn stats(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let counts = state.storage.count_by_status().await?;
+
+    let by_status: std::collections::HashMap<String, i64> =
+        counts.into_iter().map(|c| (c.status, c.count)).collect();
+
+    Ok(Json(serde_json::json!({ "by_status": by_status })))
 }

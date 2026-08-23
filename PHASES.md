@@ -10,12 +10,13 @@
 - [x] Logs estructurados (JSON) de eventos clave
 - [x] ADR-001, ADR-005
 
-## ⬜ Fase 2 — Concurrency
-- [ ] Múltiples workers concurrentes (`worker: concurrency`)
-- [ ] Límite de tareas concurrentes por worker (semáforo)
-- [ ] Registro de workers (tabla `workers`)
-- [ ] Test de concurrencia (100 jobs / 10 workers, 0 perdidos)
-- [ ] `queue_depth` observable
+## ✅ Fase 2 — Concurrency
+- [x] Múltiples workers concurrentes (`docker-compose.yml` levanta 3 réplicas por default, escalable con `--scale worker=N`)
+- [x] Límite de tareas concurrentes por worker (semáforo, `CONCURRENCY` env var)
+- [x] Registro de workers (tabla `workers` — solo registro, sin heartbeat; eso es Fase 4)
+- [x] Test de concurrencia (100 jobs / 10 workers, 0 perdidos, 0 duplicados) — `crates/common/tests/concurrency.rs`
+- [x] `queue_depth` observable (`GET /stats`, conteo por estado — versión JSON previa al Prometheus real de Fase 6)
+- [x] CI mínimo (GitHub Actions + Postgres real) para que el test de concurrencia corra en cada push, no solo en la laptop de uno
 
 ## ⬜ Fase 3 — Reliability
 - [ ] Retries con `max_attempts`
@@ -51,7 +52,7 @@
 ## ⬜ Fase 8 — Production Polish
 - [ ] Autenticación (API keys) y autorización (producer/worker/admin)
 - [ ] Rate limiting
-- [ ] CI (GitHub Actions)
+- [ ] CI extendido (build + push de imágenes Docker, releases) — el compile+test básico ya corre desde Fase 2
 - [ ] Tests de integración y de fallos
 - [ ] Threat model
 - [ ] Documentación final y ADRs restantes
