@@ -1,0 +1,53 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: queue
+      POSTGRES_PASSWORD: queue
+      POSTGRES_DB: queue
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U queue"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    environment:
+      DATABASE_URL: postgres://queue:queue@postgres:5432/queue
+      API_ADDR: 0.0.0.0:8080
+      RUST_LOG: info
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    environment:
+      DATABASE_URL: postgres://queue:queue@postgres:5432/queue
+      CONCURRENCY: 4
+      RUST_LOG: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_started
+    deploy:
+      # Fase 2: varios workers compitiendo de verdad por trabajo via
+      # SKIP LOCKED. Subilo o bajalo con `docker compose up --scale worker=N`.
+      replicas: 3
+
+volumes:
+  pgdata:

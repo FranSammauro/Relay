@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/api",
+    "crates/worker",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "macros", "migrate"] }
+uuid = { version = "=1.12.1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+dotenvy = "0.15"
+anyhow = "1"
+
+# Pines de compatibilidad con el toolchain (rustc via apt, sin rustup — ver
+# PHASES.md / README para el motivo). Varias crates del ecosistema RustCrypto
+# y del graph de sqlx empezaron a pedir edition2024 o un MSRV mas nuevo del
+# que tenemos disponible. Estos son los pines directos; el resto (hashbrown,
+# indexmap, home, zeroize, crc, unicode-segmentation) quedan resueltos via
+# `cargo update -p <crate> --precise <version>` y ya estan clavados en
+# Cargo.lock, asi que no hace falta tocarlos a mano de nuevo.
+url = "=2.4.1"
+base64ct = "=1.6.0"
+urlencoding = "=2.1.2"
