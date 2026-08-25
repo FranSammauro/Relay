@@ -13,4 +13,7 @@ pub enum QueueError {
 
     #[error("job {0} is not in a valid state for this operation")]
     InvalidState(uuid::Uuid),
+
+    #[error("redis error: {0}")]
+    Redis(#[from] redis::RedisError),
 }

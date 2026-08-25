@@ -32,9 +32,24 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
+      redis:
+        # Fase 4: no la usa ningún test todavía (la recuperación de jobs
+        # corre solo sobre Postgres, ver ADR-002), pero mantenemos el
+        # entorno de CI representativo del real por si el día de mañana
+        # se agrega un test de heartbeats.
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     env:
       DATABASE_URL: postgres://queue:queue@localhost:5432/queue
       TEST_DATABASE_URL: postgres://queue:queue@localhost:5432/queue
+      REDIS_URL: redis://localhost:6379
 
     steps:
       - uses: actions/checkout@v4

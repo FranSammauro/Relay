@@ -28,6 +28,14 @@ impl IntoResponse for ApiError {
                 tracing::error!(error = %self.0, "database error handling request");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
             }
+            QueueError::Redis(_) => {
+                // Redis acá es coordinación efímera (ver ADR-002), no fuente
+                // de verdad -- si está caído, el endpoint que lo necesita no
+                // puede contestar bien, pero no es un 500 de "algo se rompió
+                // adentro", es un 503 de "una dependencia externa no está".
+                tracing::error!(error = %self.0, "redis error handling request");
+                (StatusCode::SERVICE_UNAVAILABLE, "liveness backend unavailable".to_string())
+            }
         };
 
         (status, Json(serde_json::json!({ "error": message }))).into_response()
@@ -155,4 +163,31 @@ pub async fn stats(State(state): State<AppState>) -> Result<Json<serde_json::Val
         counts.into_iter().map(|c| (c.status, c.count)).collect();
 
     Ok(Json(serde_json::json!({ "by_status": by_status })))
+}
+
+/// Fase 4: junta dos fuentes con roles distintos (ver ADR-002). El registro
+/// en Postgres (`workers`, desde Fase 2) dice quién existió alguna vez; el
+/// heartbeat en Redis dice quién está respondiendo ahora mismo. Ninguna de
+/// las dos por sí sola contesta "¿quién está vivo?" -- la tabla no sabe si
+/// un worker murió hace una hora, y Redis no tiene historial de nadie que
+/// ya expiró.
+pub async fn list_workers(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let registered = state.storage.list_workers().await?;
+    let alive: std::collections::HashSet<String> =
+        state.heartbeats.list_alive().await?.into_iter().collect();
+
+    let workers: Vec<serde_json::Value> = registered
+        .into_iter()
+        .map(|w| {
+            let is_alive = alive.contains(&w.id);
+            serde_json::json!({
+                "id": w.id,
+                "concurrency": w.concurrency,
+                "started_at": w.started_at,
+                "alive": is_alive,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({ "workers": workers })))
 }

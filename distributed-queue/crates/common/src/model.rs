@@ -164,6 +164,10 @@ pub enum AttemptOutcome {
     Completed,
     Failed,
     TimedOut,
+    /// Fase 4: el worker que tenía el job dejó de responder y su lease
+    /// venció. No sabemos si el proceso murió del todo o solo se colgó --
+    /// solo que dejó de cumplir su promesa de terminar a tiempo.
+    LeaseExpired,
 }
 
 impl AttemptOutcome {
@@ -172,6 +176,7 @@ impl AttemptOutcome {
             AttemptOutcome::Completed => "completed",
             AttemptOutcome::Failed => "failed",
             AttemptOutcome::TimedOut => "timeout",
+            AttemptOutcome::LeaseExpired => "lease_expired",
         }
     }
 }

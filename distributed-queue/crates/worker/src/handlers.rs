@@ -10,8 +10,18 @@ pub async fn execute(job_type: &str, payload: &Value) -> Result<(), String> {
         "send_email" => send_email(payload).await,
         "generate_report" => generate_report(payload).await,
         "noop" => Ok(()),
+        "sleep" => sleep_job(payload).await,
         other => Err(format!("no handler registered for job type '{other}'")),
     }
+}
+
+/// Handler de utilidad para demos y smoke tests -- duerme la cantidad de
+/// segundos que le pidas en el payload. Sirve para probar timeouts y
+/// recovery de leases sin tener que inventar un caso de negocio real.
+async fn sleep_job(payload: &Value) -> Result<(), String> {
+    let seconds = payload.get("seconds").and_then(|v| v.as_u64()).unwrap_or(1);
+    tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+    Ok(())
 }
 
 async fn resize_image(payload: &Value) -> Result<(), String> {

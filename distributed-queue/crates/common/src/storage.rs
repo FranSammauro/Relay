@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::QueueError;
-use crate::model::{AttemptOutcome, Job, JobAttempt, JobRow, NewJob, StatusCount};
+use crate::model::{AttemptOutcome, Job, JobAttempt, JobRow, NewJob, StatusCount, WorkerInfo};
 
 /// Columnas de `jobs` compartidas por casi todas las queries de este módulo.
 /// Un solo lugar para tocar si el día de mañana se agrega una columna --
@@ -12,6 +12,22 @@ use crate::model::{AttemptOutcome, Job, JobAttempt, JobRow, NewJob, StatusCount}
 const JOB_COLUMNS: &str = r#"id, job_type, payload, status, priority, attempts, max_attempts,
                       scheduled_at, created_at, started_at, completed_at, failed_at,
                       worker_id, lease_until, timeout_seconds, idempotency_key, last_error"#;
+
+/// Cuánto margen le damos al lease de un job por encima de su propio
+/// `timeout_seconds`. El timeout ya mata el job in-process si se cuelga;
+/// el lease existe para el caso más feo, que el proceso entero del worker
+/// desaparezca (kill -9, OOM, nodo caído) antes de que el timeout llegue a
+/// dispararse. 30s de margen cubre jitter de scheduling y GC pauses sin
+/// hacer que un job legítimamente lento parezca abandonado.
+///
+/// Nota de scope: el lease se fija una sola vez al hacer claim, no se
+/// renueva mientras el job corre. Para jobs individuales esto está bien
+/// porque timeout_seconds + este margen ya define un techo razonable. Un
+/// lease renovable (heartbeat por-job en vez de por-worker) es la
+/// evolución natural si algún día hay jobs de duración muy variable, pero
+/// es la típica funcionalidad que se anota en el roadmap en vez de meterla
+/// a presión en el MVP.
+const LEASE_GRACE_SECONDS: i32 = 30;
 
 /// Storage es la única puerta de entrada a PostgreSQL, que actúa como fuente
 /// de verdad para el estado persistente del sistema (ADR-001).
@@ -151,13 +167,15 @@ impl Storage {
             SET status = 'running',
                 started_at = now(),
                 attempts = attempts + 1,
-                worker_id = $2
+                worker_id = $2,
+                lease_until = now() + ((timeout_seconds + $3) * interval '1 second')
             WHERE id = $1
             RETURNING {JOB_COLUMNS}
             "#
         ))
         .bind(row.id)
         .bind(worker_id)
+        .bind(LEASE_GRACE_SECONDS)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -183,10 +201,12 @@ impl Storage {
     pub async fn mark_completed(&self, id: Uuid) -> Result<(), QueueError> {
         let mut tx = self.pool.begin().await?;
 
-        sqlx::query(r#"UPDATE jobs SET status = 'completed', completed_at = now() WHERE id = $1"#)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            r#"UPDATE jobs SET status = 'completed', completed_at = now(), lease_until = NULL WHERE id = $1"#,
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
 
         sqlx::query(
             r#"
@@ -202,10 +222,12 @@ impl Storage {
         Ok(())
     }
 
-    /// Registra un intento fallido y decide qué pasa después: si todavía
-    /// quedan reintentos, agenda el próximo con backoff exponencial + jitter;
-    /// si no, manda el job a `dead_letter`. Devuelve el estado resultante
-    /// para que el caller pueda loguear bien lo que pasó.
+    /// Núcleo compartido de "este intento falló, ¿y ahora?". Lo usan tanto
+    /// `record_failure` (el worker reporta un fallo mientras sigue vivo)
+    /// como `reap_expired_leases` (nadie reporta nada porque el worker ya
+    /// no está, así que lo inferimos del lease vencido). Misma decisión de
+    /// retry-vs-dead_letter en los dos casos -- un job no debería tener dos
+    /// políticas de reintento distintas según quién detectó el fallo.
     ///
     /// El cálculo de backoff vive en SQL a propósito: así la decisión
     /// "cuántos intentos van" y "cuándo es el próximo" quedan atómicas
@@ -217,14 +239,12 @@ impl Storage {
     /// reintentos pegados todos al mismo segundo (thundering herd de
     /// bolsillo). Es un valor fijo por ahora -- si hace falta hacerlo
     /// configurable por job, es la próxima vuelta de tuerca, no un MVP.
-    pub async fn record_failure(
-        &self,
+    async fn transition_after_failure(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         id: Uuid,
+        attempt_status: &str,
         error: &str,
-        outcome: AttemptOutcome,
     ) -> Result<String, QueueError> {
-        let mut tx = self.pool.begin().await?;
-
         sqlx::query(
             r#"
             UPDATE job_attempts SET finished_at = now(), status = $2, error = $3
@@ -232,9 +252,9 @@ impl Storage {
             "#,
         )
         .bind(id)
-        .bind(outcome.as_str())
+        .bind(attempt_status)
         .bind(error)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
         let row: (String,) = sqlx::query_as(
@@ -244,6 +264,8 @@ impl Storage {
                 status = CASE WHEN attempts >= max_attempts THEN 'dead_letter' ELSE 'retry_scheduled' END,
                 last_error = $2,
                 failed_at = CASE WHEN attempts >= max_attempts THEN now() ELSE failed_at END,
+                worker_id = NULL,
+                lease_until = NULL,
                 scheduled_at = CASE
                     WHEN attempts >= max_attempts THEN scheduled_at
                     ELSE now() + (LEAST(2 * power(2, attempts - 1), 300) + random() * 2) * interval '1 second'
@@ -254,11 +276,65 @@ impl Storage {
         )
         .bind(id)
         .bind(error)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
 
-        tx.commit().await?;
         Ok(row.0)
+    }
+
+    /// Registra un intento fallido reportado por un worker vivo. Devuelve
+    /// el estado resultante (`retry_scheduled` o `dead_letter`) para que el
+    /// caller pueda loguear bien lo que pasó.
+    pub async fn record_failure(
+        &self,
+        id: Uuid,
+        error: &str,
+        outcome: AttemptOutcome,
+    ) -> Result<String, QueueError> {
+        let mut tx = self.pool.begin().await?;
+        let status = Self::transition_after_failure(&mut tx, id, outcome.as_str(), error).await?;
+        tx.commit().await?;
+        Ok(status)
+    }
+
+    /// El reaper: busca jobs cuyo lease venció sin que nadie los haya
+    /// marcado como terminados, y los recupera aplicando la misma lógica
+    /// de retry/DLQ que un fallo reportado normalmente.
+    ///
+    /// `FOR UPDATE SKIP LOCKED` dentro de la misma transacción que hace la
+    /// transición (no dos transacciones separadas) es lo que hace esto
+    /// seguro con múltiples workers corriendo el reaper al mismo tiempo
+    /// (ver ADR-004): si dos reapers compiten por el mismo job abandonado,
+    /// uno se queda con la fila bloqueada hasta terminar de transicionarla,
+    /// el otro simplemente no la ve y sigue de largo. Ninguno de los dos
+    /// pisa al otro ni duplica el trabajo de recovery.
+    pub async fn reap_expired_leases(&self) -> Result<Vec<(Uuid, String)>, QueueError> {
+        let mut tx = self.pool.begin().await?;
+
+        let expired: Vec<(Uuid,)> = sqlx::query_as(
+            r#"
+            SELECT id FROM jobs
+            WHERE status = 'running' AND lease_until < now()
+            FOR UPDATE SKIP LOCKED
+            "#,
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut results = Vec::with_capacity(expired.len());
+        for (id,) in expired {
+            let status = Self::transition_after_failure(
+                &mut tx,
+                id,
+                "lease_expired",
+                "worker lease expired (worker probably crashed or lost connectivity)",
+            )
+            .await?;
+            results.push((id, status));
+        }
+
+        tx.commit().await?;
+        Ok(results)
     }
 
     /// Historial completo de intentos de un job, más reciente primero.
@@ -318,6 +394,18 @@ impl Storage {
     pub async fn count_by_status(&self) -> Result<Vec<StatusCount>, QueueError> {
         let rows = sqlx::query_as::<_, StatusCount>(
             r#"SELECT status, COUNT(*) as count FROM jobs GROUP BY status"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Todos los workers que alguna vez se registraron (no solo los vivos
+    /// ahora mismo -- para eso está `Heartbeats::list_alive`, que consulta
+    /// Redis). La API combina las dos fuentes en `GET /workers`.
+    pub async fn list_workers(&self) -> Result<Vec<WorkerInfo>, QueueError> {
+        let rows = sqlx::query_as::<_, WorkerInfo>(
+            r#"SELECT id, concurrency, started_at FROM workers ORDER BY started_at DESC"#,
         )
         .fetch_all(&self.pool)
         .await?;

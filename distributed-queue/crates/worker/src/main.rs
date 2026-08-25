@@ -6,7 +6,7 @@ use tokio::sync::Semaphore;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-use common::{AttemptOutcome, Job, Storage};
+use common::{AttemptOutcome, Heartbeats, Job, Storage};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -41,12 +41,78 @@ async fn main() -> anyhow::Result<()> {
 
     storage.register_worker(&worker_id, concurrency as i32).await?;
 
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let heartbeat_interval = Duration::from_millis(
+        std::env::var("HEARTBEAT_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5_000),
+    );
+    let reaper_interval = Duration::from_millis(
+        std::env::var("REAPER_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(15_000),
+    );
+
+    let heartbeats = Heartbeats::connect(&redis_url).await?;
+
     tracing::info!(
         event = "worker_starting",
         worker_id = %worker_id,
         concurrency,
+        redis_url = %redis_url,
         "starting worker"
     );
+
+    // Fase 4: heartbeat propio, corriendo en su propia tarea de fondo. Late
+    // cada heartbeat_interval con un TTL de 3x ese intervalo en Redis -- si
+    // el worker deja de latir (se cuelga, muere, pierde la red), la clave
+    // expira sola sin que nadie tenga que barrerla a mano (ver
+    // common::heartbeats y ADR-002).
+    {
+        let heartbeats = heartbeats.clone();
+        let worker_id = worker_id.clone();
+        tokio::spawn(async move {
+            let ttl_seconds = (heartbeat_interval.as_secs() * 3).max(1);
+            loop {
+                if let Err(e) = heartbeats.beat(&worker_id, concurrency as i32, ttl_seconds).await {
+                    tracing::warn!(event = "heartbeat_failed", error = %e, "failed to send heartbeat");
+                }
+                tokio::time::sleep(heartbeat_interval).await;
+            }
+        });
+    }
+
+    // Fase 4: el reaper. Corre en todos los workers a la vez a propósito
+    // (ver ADR-004) -- así la recuperación de jobs abandonados no depende
+    // de que un único "coordinador" siga vivo. El costo es un poco de
+    // polling redundante entre workers; a esta escala es gratis comparado
+    // con el beneficio de no tener un punto único de falla para el recovery.
+    {
+        let storage = storage.clone();
+        tokio::spawn(async move {
+            loop {
+                match storage.reap_expired_leases().await {
+                    Ok(reaped) if !reaped.is_empty() => {
+                        for (job_id, status) in &reaped {
+                            tracing::warn!(
+                                event = "job_lease_expired",
+                                job_id = %job_id,
+                                result_status = %status,
+                                "recovered job with expired lease (worker probably crashed)"
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!(event = "reaper_error", error = %e, "failed to reap expired leases");
+                    }
+                }
+                tokio::time::sleep(reaper_interval).await;
+            }
+        });
+    }
 
     // Fase 2: loop de claim que dispara ejecuciones en paralelo, con un
     // semáforo como único freno de mano. La idea es simple a propósito:

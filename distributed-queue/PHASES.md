@@ -27,13 +27,15 @@
 - [x] `GET /jobs/:id/attempts` para consultar el historial
 - [x] Tests de integración contra Postgres real: retry → retry → dead_letter, y attempt exitoso
 
-## ⬜ Fase 4 — Distributed Failure Recovery
-- [ ] Heartbeats de worker
-- [ ] Worker leases (`lease_until`)
-- [ ] Detección de workers muertos
-- [ ] Recuperación de jobs abandonados
-- [ ] Redis para coordinación efímera
-- [ ] ADR-002, ADR-003, ADR-004
+## ✅ Fase 4 — Distributed Failure Recovery
+- [x] Heartbeats de worker (Redis, TTL = 3x `HEARTBEAT_INTERVAL_MS`, ver ADR-002)
+- [x] Worker leases (`lease_until = claim_time + timeout_seconds + 30s`, fijo al claim, ver ADR-003)
+- [x] Detección de workers muertos (`GET /workers`, cruza registro de Postgres con liveness de Redis)
+- [x] Recuperación de jobs abandonados (reaper descentralizado en cada worker, ver ADR-004)
+- [x] Redis para coordinación efímera (`common::Heartbeats`) — fuera del camino crítico de correctitud
+- [x] ADR-002, ADR-003, ADR-004
+- [x] Tests de integración: recovery vía Postgres puro (sin Redis) — retry y dead_letter tras lease vencido
+- [x] Smoke test manual real: `kill -9` a un worker a mitad de un job de 25s, otro worker lo recupera y completa (verificado end-to-end, no solo en tests automatizados)
 
 ## ⬜ Fase 5 — Scheduling
 - [ ] Delayed jobs (`scheduled_at`)

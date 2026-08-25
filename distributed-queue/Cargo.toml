@@ -23,6 +23,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 dotenvy = "0.15"
 anyhow = "1"
+redis = { version = "0.24", features = ["tokio-comp", "connection-manager"] }
 
 # Pines de compatibilidad con el toolchain (rustc via apt, sin rustup — ver
 # PHASES.md / README para el motivo). Varias crates del ecosistema RustCrypto
@@ -34,3 +35,4 @@ anyhow = "1"
 url = "=2.4.1"
 base64ct = "=1.6.0"
 urlencoding = "=2.1.2"
+rand = "=0.8.5"
