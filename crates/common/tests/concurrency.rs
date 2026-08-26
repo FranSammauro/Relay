@@ -7,6 +7,15 @@
 //! máquina de alguien sin Docker levantado), el test se salta con un aviso
 //! en vez de romper toda la suite. En CI corre siempre contra el servicio
 //! de postgres de GitHub Actions (ver .github/workflows/ci.yml).
+//!
+//! Ojo con esto: `claim_next_job` reclama CUALQUIER job pendiente de la
+//! tabla, no solo los de este test -- es el comportamiento real y correcto
+//! para producción, así que no lo vamos a filtrar acá. Eso significa que si
+//! corrés esto contra una base con basura de otra corrida (otro test en
+//! paralelo, una prueba manual que dejaste a medio terminar), los workers
+//! de este test también van a agarrar esos jobs ajenos. Los completamos
+//! igual (para no dejarlos colgados en `running`), pero solo contamos y
+//! validamos los que llevan la marca de esta corrida.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -23,7 +32,9 @@ async fn hundred_jobs_ten_workers_none_lost_none_duplicated() {
     let Some(storage) = support::connect_or_skip(&support::database_url()).await else {
         return;
     };
-    // si alguien apunta esto a una base compartida por error.
+
+    // marca única por corrida para distinguir "mis jobs" de basura ajena
+    // que pueda andar dando vueltas en una base compartida/sucia.
     let run_marker = format!("concurrency-test-{}", uuid::Uuid::new_v4());
 
     for i in 0..TOTAL_JOBS {
@@ -47,17 +58,24 @@ async fn hundred_jobs_ten_workers_none_lost_none_duplicated() {
     for w in 0..WORKER_COUNT {
         let storage = storage.clone();
         let worker_id = format!("test-worker-{w}");
+        let run_marker = run_marker.clone();
 
         handles.push(tokio::spawn(async move {
             let mut claimed = Vec::new();
             loop {
                 match storage.claim_next_job(&worker_id).await {
                     Ok(Some(job)) => {
+                        let belongs_to_this_run = job.job_type == run_marker;
                         storage
                             .mark_completed(job.id)
                             .await
                             .expect("mark_completed no debería fallar");
-                        claimed.push(job.id);
+                        // jobs ajenos (basura de otra corrida) se completan
+                        // igual para no dejarlos colgados, pero no cuentan
+                        // para las validaciones de este test.
+                        if belongs_to_this_run {
+                            claimed.push(job.id);
+                        }
                     }
                     Ok(None) => break,
                     Err(e) => panic!("claim_next_job falló: {e}"),

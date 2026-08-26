@@ -6,6 +6,14 @@
 //! Como en concurrency.rs, esto necesita Postgres real: la lógica de
 //! backoff vive en SQL (CASE + random() dentro del UPDATE), así que no
 //! hay forma honesta de mockearla.
+//!
+//! A diferencia de concurrency.rs, este test SÍ asume que es dueño
+//! exclusivo de lo que hay para reclamar en el momento de cada claim (por
+//! eso valida `claimed.id == job.id` en vez de tolerar jobs ajenos). Si
+//! esto falla con un mismatch de id, lo más probable es que haya un job
+//! `pending`/`retry_scheduled` viejo dando vueltas en la base de otra
+//! corrida interrumpida -- limpiá la base (`docker compose down -v` y
+//! volvé a levantar postgres) antes de reintentar.
 
 use common::{AttemptOutcome, NewJob};
 
@@ -40,6 +48,10 @@ async fn failing_job_retries_then_dead_letters() {
             .await
             .expect("claim no debería fallar")
             .unwrap_or_else(|| panic!("debería poder reclamar el job en el intento {attempt}"));
+        assert_eq!(
+            claimed.id, job.id,
+            "se reclamó un job distinto al de este test -- ¿hay basura vieja en la base?"
+        );
         assert_eq!(claimed.attempts, attempt);
 
         let status = storage
@@ -76,6 +88,7 @@ async fn failing_job_retries_then_dead_letters() {
         .await
         .expect("claim no debería fallar")
         .expect("debería poder reclamar el job en el tercer intento");
+    assert_eq!(claimed.id, job.id, "se reclamó un job distinto al de este test");
     assert_eq!(claimed.attempts, 3);
 
     let status = storage
@@ -142,6 +155,7 @@ async fn successful_job_leaves_a_completed_attempt() {
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(claimed.id, job.id, "se reclamó un job distinto al de este test");
 
     storage.mark_completed(claimed.id).await.unwrap();
 

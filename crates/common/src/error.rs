@@ -5,7 +5,7 @@ pub enum QueueError {
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
 
-    #[error("job not found: {0}")]
+    #[error("resource not found: {0}")]
     NotFound(uuid::Uuid),
 
     #[error("invalid job payload: {0}")]
@@ -13,4 +13,7 @@ pub enum QueueError {
 
     #[error("job {0} is not in a valid state for this operation")]
     InvalidState(uuid::Uuid),
+
+    #[error("redis error: {0}")]
+    Redis(#[from] redis::RedisError),
 }

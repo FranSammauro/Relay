@@ -5,7 +5,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use common::{NewJob, QueueError};
+use common::{NewCronSchedule, NewJob, QueueError};
 
 use crate::state::AppState;
 
@@ -27,6 +27,14 @@ impl IntoResponse for ApiError {
             QueueError::Database(_) => {
                 tracing::error!(error = %self.0, "database error handling request");
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
+            }
+            QueueError::Redis(_) => {
+                // Redis acá es coordinación efímera (ver ADR-002), no fuente
+                // de verdad -- si está caído, el endpoint que lo necesita no
+                // puede contestar bien, pero no es un 500 de "algo se rompió
+                // adentro", es un 503 de "una dependencia externa no está".
+                tracing::error!(error = %self.0, "redis error handling request");
+                (StatusCode::SERVICE_UNAVAILABLE, "liveness backend unavailable".to_string())
             }
         };
 
@@ -155,4 +163,90 @@ pub async fn stats(State(state): State<AppState>) -> Result<Json<serde_json::Val
         counts.into_iter().map(|c| (c.status, c.count)).collect();
 
     Ok(Json(serde_json::json!({ "by_status": by_status })))
+}
+
+/// Fase 4: junta dos fuentes con roles distintos (ver ADR-002). El registro
+/// en Postgres (`workers`, desde Fase 2) dice quién existió alguna vez; el
+/// heartbeat en Redis dice quién está respondiendo ahora mismo. Ninguna de
+/// las dos por sí sola contesta "¿quién está vivo?" -- la tabla no sabe si
+/// un worker murió hace una hora, y Redis no tiene historial de nadie que
+/// ya expiró.
+pub async fn list_workers(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let registered = state.storage.list_workers().await?;
+    let alive: std::collections::HashSet<String> =
+        state.heartbeats.list_alive().await?.into_iter().collect();
+
+    let workers: Vec<serde_json::Value> = registered
+        .into_iter()
+        .map(|w| {
+            let is_alive = alive.contains(&w.id);
+            serde_json::json!({
+                "id": w.id,
+                "concurrency": w.concurrency,
+                "started_at": w.started_at,
+                "alive": is_alive,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({ "workers": workers })))
+}
+
+/// Fase 5: crea un cron schedule. Valida la expresión al vuelo -- una
+/// expresión inválida vuelve como 400, no como un schedule roto que recién
+/// falla cuando el scheduler intenta usarlo por primera vez.
+pub async fn create_cron_schedule(
+    State(state): State<AppState>,
+    Json(new): Json<NewCronSchedule>,
+) -> Result<(StatusCode, Json<common::CronSchedule>), ApiError> {
+    if new.name.trim().is_empty() {
+        return Err(QueueError::InvalidPayload("`name` is required".into()).into());
+    }
+    if new.job_type.trim().is_empty() {
+        return Err(QueueError::InvalidPayload("`type` is required".into()).into());
+    }
+
+    let schedule = state.storage.create_cron_schedule(new).await?;
+
+    tracing::info!(
+        event = "cron_schedule_created",
+        schedule_id = %schedule.id,
+        schedule_name = %schedule.name,
+        cron_expr = %schedule.cron_expr,
+        next_run_at = %schedule.next_run_at,
+        "cron schedule created"
+    );
+
+    Ok((StatusCode::CREATED, Json(schedule)))
+}
+
+pub async fn list_cron_schedules(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<common::CronSchedule>>, ApiError> {
+    Ok(Json(state.storage.list_cron_schedules().await?))
+}
+
+pub async fn get_cron_schedule(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<common::CronSchedule>, ApiError> {
+    let schedule = state
+        .storage
+        .get_cron_schedule(id)
+        .await?
+        .ok_or(QueueError::NotFound(id))?;
+    Ok(Json(schedule))
+}
+
+pub async fn delete_cron_schedule(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let deleted = state.storage.delete_cron_schedule(id).await?;
+    if deleted {
+        tracing::info!(event = "cron_schedule_deleted", schedule_id = %id);
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(QueueError::NotFound(id).into())
+    }
 }

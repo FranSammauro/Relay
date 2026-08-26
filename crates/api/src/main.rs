@@ -27,7 +27,10 @@ async fn main() -> anyhow::Result<()> {
     storage.migrate().await?;
     tracing::info!(event = "migrations_applied", "database ready");
 
-    let state = AppState { storage };
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let heartbeats = common::Heartbeats::connect(&redis_url).await?;
+
+    let state = AppState { storage, heartbeats };
 
     let app = Router::new()
         .route("/health", get(handlers::health))
@@ -38,6 +41,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/jobs/:id/attempts", get(handlers::get_job_attempts))
         .route("/jobs/:id", delete(handlers::cancel_job))
         .route("/stats", get(handlers::stats))
+        .route("/workers", get(handlers::list_workers))
+        .route("/cron", post(handlers::create_cron_schedule))
+        .route("/cron", get(handlers::list_cron_schedules))
+        .route("/cron/:id", get(handlers::get_cron_schedule))
+        .route("/cron/:id", delete(handlers::delete_cron_schedule))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state);

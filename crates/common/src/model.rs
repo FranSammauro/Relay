@@ -164,6 +164,10 @@ pub enum AttemptOutcome {
     Completed,
     Failed,
     TimedOut,
+    /// Fase 4: el worker que tenía el job dejó de responder y su lease
+    /// venció. No sabemos si el proceso murió del todo o solo se colgó --
+    /// solo que dejó de cumplir su promesa de terminar a tiempo.
+    LeaseExpired,
 }
 
 impl AttemptOutcome {
@@ -172,6 +176,7 @@ impl AttemptOutcome {
             AttemptOutcome::Completed => "completed",
             AttemptOutcome::Failed => "failed",
             AttemptOutcome::TimedOut => "timeout",
+            AttemptOutcome::LeaseExpired => "lease_expired",
         }
     }
 }
@@ -203,4 +208,42 @@ pub struct WorkerInfo {
 pub struct StatusCount {
     pub status: String,
     pub count: i64,
+}
+
+/// Fase 5: fila de `cron_schedules`. Es la "plantilla" de un job
+/// recurrente -- cada disparo crea una fila normal en `jobs`, no hay un
+/// tipo de ejecución especial para esto.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct CronSchedule {
+    pub id: Uuid,
+    pub name: String,
+    pub cron_expr: String,
+    pub job_type: String,
+    pub payload: serde_json::Value,
+    pub priority: i32,
+    pub max_attempts: i32,
+    pub timeout_seconds: i32,
+    pub enabled: bool,
+    pub next_run_at: DateTime<Utc>,
+    pub last_run_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Datos para crear un cron schedule nuevo. `next_run_at` no está acá a
+/// propósito -- lo calcula `Storage::create_cron_schedule` a partir de
+/// `cron_expr`, no lo elige quien llama.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NewCronSchedule {
+    pub name: String,
+    pub cron_expr: String,
+    #[serde(rename = "type")]
+    pub job_type: String,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+    #[serde(default = "default_priority")]
+    pub priority: i32,
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: i32,
+    #[serde(default = "default_timeout_seconds")]
+    pub timeout_seconds: i32,
 }

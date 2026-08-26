@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 common = { path = "../common" }
+sqlx.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

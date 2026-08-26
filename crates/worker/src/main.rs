@@ -6,7 +6,7 @@ use tokio::sync::Semaphore;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-use common::{AttemptOutcome, Job, Storage};
+use common::{AttemptOutcome, Heartbeats, Job, Storage};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -41,12 +41,96 @@ async fn main() -> anyhow::Result<()> {
 
     storage.register_worker(&worker_id, concurrency as i32).await?;
 
+    let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let heartbeat_interval = Duration::from_millis(
+        std::env::var("HEARTBEAT_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5_000),
+    );
+    let reaper_interval = Duration::from_millis(
+        std::env::var("REAPER_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(15_000),
+    );
+
+    let heartbeats = Heartbeats::connect(&redis_url).await?;
+
     tracing::info!(
         event = "worker_starting",
         worker_id = %worker_id,
         concurrency,
+        redis_url = %redis_url,
         "starting worker"
     );
+
+    // Fase 4: heartbeat propio, corriendo en su propia tarea de fondo. Late
+    // cada heartbeat_interval con un TTL de 3x ese intervalo en Redis -- si
+    // el worker deja de latir (se cuelga, muere, pierde la red), la clave
+    // expira sola sin que nadie tenga que barrerla a mano (ver
+    // common::heartbeats y ADR-002).
+    {
+        let heartbeats = heartbeats.clone();
+        let worker_id = worker_id.clone();
+        tokio::spawn(async move {
+            let ttl_seconds = (heartbeat_interval.as_secs() * 3).max(1);
+            loop {
+                if let Err(e) = heartbeats.beat(&worker_id, concurrency as i32, ttl_seconds).await {
+                    tracing::warn!(event = "heartbeat_failed", error = %e, "failed to send heartbeat");
+                }
+                tokio::time::sleep(heartbeat_interval).await;
+            }
+        });
+    }
+
+    // Fase 4: el reaper. Corre en todos los workers a la vez a propósito
+    // (ver ADR-004) -- así la recuperación de jobs abandonados no depende
+    // de que un único "coordinador" siga vivo. El costo es un poco de
+    // polling redundante entre workers; a esta escala es gratis comparado
+    // con el beneficio de no tener un punto único de falla para el recovery.
+    {
+        let storage = storage.clone();
+        tokio::spawn(async move {
+            loop {
+                match storage.reap_expired_leases().await {
+                    Ok(reaped) if !reaped.is_empty() => {
+                        for (job_id, status) in &reaped {
+                            tracing::warn!(
+                                event = "job_lease_expired",
+                                job_id = %job_id,
+                                result_status = %status,
+                                "recovered job with expired lease (worker probably crashed)"
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!(event = "reaper_error", error = %e, "failed to reap expired leases");
+                    }
+                }
+                tokio::time::sleep(reaper_interval).await;
+            }
+        });
+    }
+
+    // Fase 5: scheduler de cron, con exclusión mutua vía advisory lock de
+    // Postgres (ver ADR-006). Cada worker intenta ser el líder; el que lo
+    // consigue corre el loop de "disparar lo que esté vencido"; el resto
+    // reintenta cada scheduler_interval por si el líder actual se cae.
+    let scheduler_interval = Duration::from_millis(
+        std::env::var("SCHEDULER_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10_000),
+    );
+    {
+        let storage = storage.clone();
+        let worker_id = worker_id.clone();
+        tokio::spawn(async move {
+            run_scheduler_loop(storage, &worker_id, scheduler_interval).await;
+        });
+    }
 
     // Fase 2: loop de claim que dispara ejecuciones en paralelo, con un
     // semáforo como único freno de mano. La idea es simple a propósito:
@@ -166,4 +250,89 @@ async fn record_failure(
         error = %err,
         "job attempt failed"
     );
+}
+
+/// Intenta ser el líder del scheduler de cron; si lo consigue, corre el
+/// loop de disparo hasta perder el lock (la conexión se cae, el proceso se
+/// muere, lo que sea). Si no lo consigue, simplemente reintenta más tarde
+/// -- esto es polling barato: `pg_try_advisory_lock` es no bloqueante y no
+/// pelea con nadie por filas ni índices.
+async fn run_scheduler_loop(storage: Storage, worker_id: &str, interval: Duration) {
+    loop {
+        match storage.try_become_scheduler_leader().await {
+            Ok(Some(leader_conn)) => {
+                tracing::info!(
+                    event = "scheduler_leader_acquired",
+                    worker_id = %worker_id,
+                    "acquired cron scheduler leadership"
+                );
+                // mantenemos la conexión viva (el lock es de sesión, se
+                // libera solo si soltamos esta conexión puntual) mientras
+                // dure el liderazgo. Si algo la tira abajo, salimos del
+                // loop interno y volvemos a intentar ser líder más arriba.
+                run_as_leader(&storage, worker_id, interval, leader_conn).await;
+                tracing::warn!(
+                    event = "scheduler_leader_lost",
+                    worker_id = %worker_id,
+                    "lost cron scheduler leadership, will retry"
+                );
+            }
+            Ok(None) => {
+                // otro worker ya es líder, no hay nada para hacer.
+            }
+            Err(e) => {
+                tracing::error!(event = "scheduler_leader_check_failed", error = %e, "failed to check scheduler leadership");
+            }
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+async fn run_as_leader(
+    storage: &Storage,
+    worker_id: &str,
+    interval: Duration,
+    mut leader_conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
+) {
+    loop {
+        // Un SELECT 1 trivial sobre la conexión que sostiene el advisory
+        // lock: si el link con Postgres se cortó, esto falla y soltamos el
+        // liderazgo en vez de seguir actuando como líder a ciegas.
+        if sqlx::query("SELECT 1").execute(&mut *leader_conn).await.is_err() {
+            return;
+        }
+
+        match storage.due_cron_schedules().await {
+            Ok(due) => {
+                for schedule in due {
+                    match storage.fire_cron_schedule(&schedule).await {
+                        Ok(job) => {
+                            tracing::info!(
+                                event = "cron_fired",
+                                schedule_id = %schedule.id,
+                                schedule_name = %schedule.name,
+                                job_id = %job.id,
+                                worker_id = %worker_id,
+                                "cron schedule fired"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                event = "cron_fire_error",
+                                schedule_id = %schedule.id,
+                                schedule_name = %schedule.name,
+                                error = %e,
+                                "failed to fire cron schedule"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(event = "cron_scan_error", error = %e, "failed to scan due cron schedules");
+            }
+        }
+
+        tokio::time::sleep(interval).await;
+    }
 }
