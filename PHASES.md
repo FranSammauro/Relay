@@ -44,11 +44,12 @@
 - [x] Tests de integración contra Postgres real: disparo de cron con avance de `next_run_at`, idempotencia ante doble disparo, y exclusión mutua del liderazgo
 - [x] Smoke test manual real: cron schedule creado vía API, disparado solo por el scheduler, job creado y completado — verificado end-to-end por HTTP
 
-## ⬜ Fase 6 — Operational Features
-- [ ] Métricas Prometheus
-- [ ] Dashboard web
-- [ ] CLI
-- [ ] Graceful shutdown (SIGTERM)
+## ✅ Fase 6 — Operational Features
+- [x] Métricas Prometheus (`GET /metrics`, calculadas al vuelo desde Postgres — sin contadores en memoria de proceso, `job_attempts` como `_total`, percentiles de duración vía `percentile_cont` de SQL)
+- [x] Dashboard web (`GET /`, HTML+JS estático sin build step ni dependencias nuevas, polling cada 4s sobre los endpoints existentes)
+- [x] CLI (`queue-cli`, nuevo binario del workspace, habla directo con Postgres via `common::Storage`, parsing de argumentos a mano sin `clap`)
+- [x] Graceful shutdown (SIGTERM/Ctrl+C compartido en `common::shutdown`; API drena requests en vuelo, worker deja de reclamar y espera a que terminen los jobs en curso con un plazo de `SHUTDOWN_GRACE_SECONDS` antes de salir, y limpia su heartbeat de Redis al bajar)
+- [x] Validado manualmente de punta a punta: SIGTERM real a mitad de un job de 8s — el worker esperó a que terminara completo antes de cerrar
 
 ## ⬜ Fase 7 — Performance
 - [ ] Benchmarks reproducibles (submission/queue/execution latency)

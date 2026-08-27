@@ -9,16 +9,16 @@ explore real concurrency and distributed systems problems.
 > This project is developed in phases. See [`PHASES.md`](./PHASES.md) for
 > current status and the checklist for each phase.
 
-## Architecture (Phase 5)
+## Architecture (Phase 6)
 
 ```
 Client --POST /jobs--> API (axum) --> PostgreSQL (source of truth)
-                                            ^
-                                            |
-                                    Worker 1, Worker 2, Worker N
-                                    (concurrency + heartbeat +
-                                     reaper + scheduler leader
-                                     candidate, each one)
+          |                                  ^
+          |                                  |
+     Dashboard (/)                   Worker 1, Worker 2, Worker N
+     Metrics (/metrics)              (concurrency + heartbeat +
+     queue-cli (CLI)                  reaper + scheduler leader
+                                       candidate, each one)
                                             |
                                             v
                                     Redis (heartbeats, TTL)
@@ -27,10 +27,12 @@ Client --POST /jobs--> API (axum) --> PostgreSQL (source of truth)
 - **PostgreSQL** persists the full state of every job, its attempt
   history, its leases, and the cron schedules (see `migrations/`). It's
   the single source of truth — if a worker, the API, or Redis go down, no
-  job is lost.
+  job is lost. It's also the source of the metrics: there are no counters
+  accumulated in any process's memory (see below).
 - **API (axum)** exposes HTTP endpoints to create/query/cancel jobs, check
   their execution history, the queue's aggregate state, which workers are
-  currently alive, and manage cron schedules.
+  currently alive, manage cron schedules, a web dashboard (`/`), and
+  Prometheus-format metrics (`/metrics`).
 - **Worker** polls the `jobs` table using
   `SELECT ... FOR UPDATE SKIP LOCKED`, which allows multiple workers to
   compete for work without blocking each other or claiming the same job
@@ -47,6 +49,8 @@ Client --POST /jobs--> API (axum) --> PostgreSQL (source of truth)
   - **Cron scheduler**: competes for a Postgres advisory lock (see
     ADR-006); whoever gets it is the only one scanning and firing due
     `cron_schedules`, creating the corresponding real job.
+- **`queue-cli`**: command-line binary that talks directly to Postgres
+  (not the API) to operate the system — useful even if the API is down.
 
 Redis is used exclusively for ephemeral coordination (heartbeats). If it
 goes down, visibility into who's alive is lost, but recovering abandoned
@@ -54,6 +58,11 @@ jobs and the cron scheduler keep working exactly the same, since both run
 entirely on PostgreSQL and never depend on Redis — this is explicitly
 tested in `crates/common/tests/recovery.rs` and
 `crates/common/tests/scheduling.rs`, neither of which spins up Redis.
+
+Both the API and the worker handle SIGTERM/Ctrl+C gracefully: the API
+finishes in-flight requests before shutting down, and the worker stops
+claiming new jobs and waits for the ones already running to finish (up to
+a maximum, `SHUTDOWN_GRACE_SECONDS`) before exiting.
 
 ## Quick start
 
@@ -85,6 +94,12 @@ curl localhost:8080/jobs/<id>/attempts
 
 curl localhost:8080/workers
 # => who's registered and who's alive right now
+
+curl localhost:8080/metrics
+# => Prometheus-format metrics
+
+open http://localhost:8080/ in a browser
+# => live dashboard with queue_depth, workers, and recent jobs
 
 curl -X POST localhost:8080/cron \
   -H "Content-Type: application/json" \
@@ -125,6 +140,36 @@ curl -X POST localhost:8080/cron \
 # fire on its own
 curl localhost:8080/cron/<id>
 # => last_run_at is now set, next_run_at advanced to the next minute
+```
+
+### Try a graceful shutdown
+
+```bash
+# send a slow job and note which worker claims it
+curl -X POST localhost:8080/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"type": "sleep", "payload": {"seconds": 8}, "timeout_seconds": 30}'
+
+# send it SIGTERM (docker stop does this automatically)
+docker kill --signal=TERM <worker_container>
+# or locally: kill -TERM <pid>
+
+# the worker stops claiming new work, waits for the 8-second job to
+# finish completely, and only then shuts down -- watch its logs for the
+# sequence: worker_draining -> worker_drained -> worker_stopped
+```
+
+### Using the CLI
+
+`queue-cli` talks directly to Postgres (not the API) — it works even if
+the API is down:
+
+```bash
+cargo run -p queue-cli -- jobs list --status dead_letter
+cargo run -p queue-cli -- jobs attempts <id>
+cargo run -p queue-cli -- stats
+cargo run -p queue-cli -- cron create --name daily-report --expr "0 6 * * *" --type generate_report
+cargo run -p queue-cli -- --help
 ```
 
 ### Running locally without Docker
@@ -170,16 +215,18 @@ and hit a surprising failure, truncate the tables and try again:
 psql "$DATABASE_URL" -c "TRUNCATE jobs, job_attempts, workers, cron_schedules RESTART IDENTITY CASCADE;"
 ```
 
-## Endpoints (Phase 5)
+## Endpoints (Phase 6)
 
 | Method | Route                | Description                          |
 |--------|----------------------|---------------------------------------|
+| GET    | `/`                  | Web dashboard (live HTML)             |
 | POST   | `/jobs`              | Create a job                          |
 | GET    | `/jobs`              | List jobs (`?status=`, `?limit=`)     |
 | GET    | `/jobs/:id`          | Get a job                             |
 | GET    | `/jobs/:id/attempts` | Get a job's attempt history           |
 | DELETE | `/jobs/:id`          | Cancel a job (only if still pending)  |
 | GET    | `/stats`             | Job count by status (`queue_depth`)   |
+| GET    | `/metrics`           | Prometheus-format metrics             |
 | GET    | `/workers`           | Registered workers and who's alive now |
 | POST   | `/cron`              | Create a cron schedule                |
 | GET    | `/cron`              | List cron schedules                   |
@@ -187,6 +234,8 @@ psql "$DATABASE_URL" -c "TRUNCATE jobs, job_attempts, workers, cron_schedules RE
 | DELETE | `/cron/:id`          | Delete a cron schedule                |
 | GET    | `/health`            | Liveness                              |
 | GET    | `/ready`             | Readiness (checks DB connectivity)    |
+
+To operate without going through HTTP, see `queue-cli` above.
 
 ## Project status
 
@@ -204,7 +253,9 @@ See [`docs/adr/`](./docs/adr).
   lease eventually expires and another worker re-runs it. Handlers should
   be idempotent whenever possible.
 - **PostgreSQL as source of truth**: any data critical to system
-  correctness lives in PostgreSQL, never only in Redis.
+  correctness lives in PostgreSQL, never only in Redis. The `/metrics`
+  data too: it's computed on the fly, never accumulated in process
+  memory, so a restart never loses any of it.
 - **Concurrency without loss or duplication**: verified with an
   integration test against a real Postgres instance (100 jobs / 10
   concurrent workers), not just "should work" on paper.
@@ -225,3 +276,9 @@ See [`docs/adr/`](./docs/adr).
   double firing of the same time slot doesn't create two jobs. Verified
   with an integration test and with a real manual test: a schedule created
   via the API fired on its own, unattended, with correct timing.
+- **No in-flight job gets cut off by a deploy**: SIGTERM makes the worker
+  stop claiming new work and wait (up to a maximum,
+  `SHUTDOWN_GRACE_SECONDS`) for jobs already in progress to finish before
+  exiting. Verified with a real manual test: SIGTERM sent mid-way through
+  an 8-second job, the worker waited the full 8 seconds before shutting
+  down.

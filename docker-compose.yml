@@ -59,7 +59,13 @@ services:
       HEARTBEAT_INTERVAL_MS: 5000
       REAPER_INTERVAL_MS: 15000
       SCHEDULER_INTERVAL_MS: 10000
+      SHUTDOWN_GRACE_SECONDS: 30
       RUST_LOG: info
+    # Docker manda SIGTERM y espera esto antes de mandar SIGKILL. Tiene que
+    # ser mayor a SHUTDOWN_GRACE_SECONDS -- si no, Docker mata el proceso a
+    # la fuerza antes de que termine de drenar los jobs en vuelo, exactamente
+    # lo que graceful shutdown existe para evitar (Fase 6).
+    stop_grace_period: 35s
     depends_on:
       postgres:
         condition: service_healthy

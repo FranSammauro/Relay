@@ -210,6 +210,15 @@ pub struct StatusCount {
     pub count: i64,
 }
 
+/// Percentiles de duración de ejecución por tipo de job, para `GET /metrics`.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct JobDurationStats {
+    pub job_type: String,
+    pub p50_seconds: Option<f64>,
+    pub p95_seconds: Option<f64>,
+    pub sample_count: i64,
+}
+
 /// Fase 5: fila de `cron_schedules`. Es la "plantilla" de un job
 /// recurrente -- cada disparo crea una fila normal en `jobs`, no hay un
 /// tipo de ejecución especial para esto.

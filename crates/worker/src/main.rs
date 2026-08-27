@@ -65,6 +65,18 @@ async fn main() -> anyhow::Result<()> {
         "starting worker"
     );
 
+    // Fase 6: canal de shutdown gracioso. Una sola señal (SIGTERM o
+    // Ctrl+C) avisa a todo lo que le importa que hay que empezar a
+    // terminar en vez de cortar en seco -- el loop principal deja de
+    // reclamar jobs nuevos, y más abajo esperamos a que los que ya están
+    // en vuelo terminen antes de salir del proceso.
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        common::shutdown::signal().await;
+        tracing::info!(event = "shutdown_signal_received", "received shutdown signal, winding down");
+        let _ = shutdown_tx.send(true);
+    });
+
     // Fase 4: heartbeat propio, corriendo en su propia tarea de fondo. Late
     // cada heartbeat_interval con un TTL de 3x ese intervalo en Redis -- si
     // el worker deja de latir (se cuelga, muere, pierde la red), la clave
@@ -144,8 +156,14 @@ async fn main() -> anyhow::Result<()> {
         // acquire_owned nos deja mover el permiso adentro del spawn sin
         // pelearnos con lifetimes -- si no está disponible, se queda acá
         // esperando, que es exactamente el comportamiento que queremos:
-        // no reclamar más trabajo del que podemos correr.
-        let permit = semaphore.clone().acquire_owned().await?;
+        // no reclamar más trabajo del que podemos correr. El select! de
+        // acá afuera es lo único nuevo en Fase 6: si llega la señal de
+        // shutdown mientras esperamos un permiso libre, cortamos el loop
+        // en vez de seguir pidiendo trabajo nuevo.
+        let permit = tokio::select! {
+            _ = shutdown_rx.changed() => break,
+            permit = semaphore.clone().acquire_owned() => permit?,
+        };
 
         match storage.claim_next_job(&worker_id).await {
             Ok(Some(job)) => {
@@ -158,17 +176,71 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(None) => {
                 // no había nada para reclamar, devolvemos el permiso y
-                // esperamos el poll_interval como en Fase 1.
+                // esperamos el poll_interval como en Fase 1 -- salvo que
+                // llegue el shutdown mientras tanto, en cuyo caso no tiene
+                // sentido seguir esperando para volver a preguntar lo mismo.
                 drop(permit);
-                tokio::time::sleep(poll_interval).await;
+                tokio::select! {
+                    _ = shutdown_rx.changed() => break,
+                    _ = tokio::time::sleep(poll_interval) => {}
+                }
             }
             Err(e) => {
                 drop(permit);
                 tracing::error!(event = "claim_error", error = %e, "failed to claim job, backing off");
-                tokio::time::sleep(poll_interval * 2).await;
+                tokio::select! {
+                    _ = shutdown_rx.changed() => break,
+                    _ = tokio::time::sleep(poll_interval * 2) => {}
+                }
             }
         }
     }
+
+    // Ya no reclamamos jobs nuevos. Lo único que falta es no dejar tirados
+    // a medio terminar los que ya estaban en vuelo -- esperamos a que se
+    // liberen todos los permisos del semáforo (cada tarea de job los
+    // suelta al terminar), con un techo de `SHUTDOWN_GRACE_SECONDS` por si
+    // alguno se está colgando. Si el plazo se cumple igual salimos: esos
+    // jobs van a quedar con el lease corriendo y el reaper de cualquier
+    // otro worker los va a recuperar solo (Fase 4, ADR-004) -- graceful
+    // shutdown no es una promesa de esperar para siempre, es evitar el
+    // caso común de matar un job a mitad de camino sin necesidad.
+    let shutdown_grace = Duration::from_secs(
+        std::env::var("SHUTDOWN_GRACE_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30),
+    );
+
+    tracing::info!(
+        event = "worker_draining",
+        worker_id = %worker_id,
+        grace_seconds = shutdown_grace.as_secs(),
+        "no longer claiming new jobs, waiting for in-flight jobs to finish"
+    );
+
+    match tokio::time::timeout(shutdown_grace, semaphore.acquire_many(concurrency as u32)).await {
+        Ok(Ok(_permits)) => {
+            tracing::info!(event = "worker_drained", worker_id = %worker_id, "all in-flight jobs finished");
+        }
+        Ok(Err(e)) => {
+            tracing::error!(event = "worker_drain_error", worker_id = %worker_id, error = %e, "semaphore closed unexpectedly during drain");
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                event = "worker_drain_timeout",
+                worker_id = %worker_id,
+                "shutdown grace period elapsed with jobs still in flight; they'll be recovered via lease expiry"
+            );
+        }
+    }
+
+    if let Err(e) = heartbeats.forget(&worker_id).await {
+        tracing::warn!(event = "heartbeat_forget_failed", error = %e, "failed to clear heartbeat on shutdown");
+    }
+
+    tracing::info!(event = "worker_stopped", worker_id = %worker_id, "worker shut down gracefully");
+    Ok(())
 }
 
 async fn run_job(storage: &Storage, worker_id: &str, job: Job) {

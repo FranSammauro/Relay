@@ -1087,6 +1087,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "queue-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "common",
+ "dotenvy",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"

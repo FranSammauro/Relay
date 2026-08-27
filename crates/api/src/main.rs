@@ -35,6 +35,8 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/health", get(handlers::health))
         .route("/ready", get(handlers::ready))
+        .route("/metrics", get(handlers::metrics))
+        .route("/", get(handlers::dashboard))
         .route("/jobs", post(handlers::create_job))
         .route("/jobs", get(handlers::list_jobs))
         .route("/jobs/:id", get(handlers::get_job))
@@ -57,7 +59,13 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(event = "api_starting", %addr, "starting job queue API");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    // Fase 6: graceful shutdown -- terminamos requests en vuelo antes de
+    // cerrar en vez de cortar la conexión a media respuesta cuando llega
+    // SIGTERM (Docker/Kubernetes lo mandan al bajar el contenedor).
+    axum::serve(listener, app)
+        .with_graceful_shutdown(common::shutdown::signal())
+        .await?;
+    tracing::info!(event = "api_stopped", "API shut down gracefully");
 
     Ok(())
 }

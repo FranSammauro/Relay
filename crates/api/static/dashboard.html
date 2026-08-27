@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>distributed-queue // console</title>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --panel: #10141d;
+    --panel-2: #151a25;
+    --line: #232936;
+    --text: #e6e9ef;
+    --dim: #7c8699;
+    --dimmer: #4d5566;
+    --amber: #d9a441;
+    --cyan: #4fb3d9;
+    --green: #4cae7d;
+    --red: #e5534b;
+    --violet: #9d7bd8;
+    --mono: ui-monospace, "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  a { color: inherit; }
+  header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    padding: 18px 24px;
+    border-bottom: 1px solid var(--line);
+  }
+  header h1 {
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    margin: 0;
+  }
+  header h1 .prompt { color: var(--dimmer); font-weight: 400; }
+  #clock { color: var(--dim); font-size: 12px; }
+  #clock .dot {
+    display: inline-block;
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--green);
+    margin-right: 6px;
+    animation: pulse 2s infinite;
+  }
+  #clock.stale .dot { background: var(--red); animation: none; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+  main {
+    max-width: 1120px;
+    margin: 0 auto;
+    padding: 24px;
+    display: grid;
+    gap: 20px;
+  }
+
+  .eyebrow {
+    color: var(--dimmer);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin: 0 0 10px;
+  }
+
+  .depth-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+  }
+  .depth-cell {
+    background: var(--panel);
+    padding: 14px 16px;
+  }
+  .depth-cell .n {
+    font-size: 26px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .depth-cell .label {
+    color: var(--dim);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-top: 2px;
+  }
+  .depth-cell .bar {
+    height: 3px;
+    background: var(--line);
+    margin-top: 10px;
+    overflow: hidden;
+  }
+  .depth-cell .bar > span { display: block; height: 100%; }
+
+  .st-pending .n, .st-pending .bar>span { color: var(--amber); background: var(--amber); }
+  .st-running .n, .st-running .bar>span { color: var(--cyan); background: var(--cyan); }
+  .st-completed .n, .st-completed .bar>span { color: var(--green); background: var(--green); }
+  .st-retry_scheduled .n, .st-retry_scheduled .bar>span { color: var(--violet); background: var(--violet); }
+  .st-dead_letter .n, .st-dead_letter .bar>span { color: var(--red); background: var(--red); }
+  .st-failed .n, .st-failed .bar>span { color: var(--red); background: var(--red); }
+  .st-cancelled .n, .st-cancelled .bar>span { color: var(--dim); background: var(--dim); }
+
+  .cols {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+  }
+  @media (max-width: 720px) { .cols { grid-template-columns: 1fr; } }
+
+  .panel {
+    border: 1px solid var(--line);
+    background: var(--panel);
+  }
+  .panel-head {
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--line);
+    color: var(--dim);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  table { width: 100%; border-collapse: collapse; }
+  td, th {
+    padding: 8px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--line);
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  th {
+    color: var(--dimmer);
+    font-weight: 500;
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.05em;
+  }
+  tr:last-child td { border-bottom: none; }
+  .id { color: var(--dim); }
+  .mono-dim { color: var(--dim); }
+
+  .worker-dot {
+    display: inline-block;
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    margin-right: 8px;
+  }
+  .worker-dot.alive { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .worker-dot.dead { background: var(--dimmer); }
+
+  .badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border: 1px solid currentColor;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  .badge.pending { color: var(--amber); }
+  .badge.running { color: var(--cyan); }
+  .badge.completed { color: var(--green); }
+  .badge.retry_scheduled { color: var(--violet); }
+  .badge.dead_letter, .badge.failed { color: var(--red); }
+  .badge.cancelled { color: var(--dim); }
+
+  .empty { color: var(--dimmer); padding: 16px 14px; font-style: normal; }
+  footer {
+    color: var(--dimmer);
+    font-size: 11px;
+    text-align: center;
+    padding: 24px;
+  }
+  footer a { text-decoration: underline; text-underline-offset: 2px; }
+</style>
+</head>
+<body>
+  <header>
+    <h1><span class="prompt">$</span> distributed-queue</h1>
+    <div id="clock"><span class="dot"></span><span id="clock-text">conectando...</span></div>
+  </header>
+
+  <main>
+    <section>
+      <p class="eyebrow">queue_depth</p>
+      <div class="depth-grid" id="depth-grid"></div>
+    </section>
+
+    <div class="cols">
+      <section class="panel">
+        <div class="panel-head">workers</div>
+        <table>
+          <thead><tr><th>estado</th><th>id</th><th>concurrency</th><th>desde</th></tr></thead>
+          <tbody id="workers-body"></tbody>
+        </table>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">cron schedules</div>
+        <table>
+          <thead><tr><th>nombre</th><th>expr</th><th>próxima corrida</th></tr></thead>
+          <tbody id="cron-body"></tbody>
+        </table>
+      </section>
+    </div>
+
+    <section class="panel">
+      <div class="panel-head">jobs recientes</div>
+      <table>
+        <thead><tr><th>estado</th><th>id</th><th>tipo</th><th>intento</th><th>worker</th><th>creado</th></tr></thead>
+        <tbody id="jobs-body"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <footer>
+    actualiza cada 4s &middot; <a href="/metrics">/metrics</a> (Prometheus) &middot; <a href="/stats">/stats</a> &middot; <a href="/workers">/workers</a>
+  </footer>
+
+<script>
+const STATUS_ORDER = ["pending", "running", "retry_scheduled", "completed", "dead_letter", "failed", "cancelled"];
+
+function timeAgo(iso) {
+  if (!iso) return "-";
+  const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 5) return "ahora";
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  return Math.floor(s / 3600) + "h";
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+async function tick() {
+  const clock = document.getElementById("clock");
+  const clockText = document.getElementById("clock-text");
+  try {
+    const [statsRes, workersRes, jobsRes, cronRes] = await Promise.all([
+      fetch("/stats"), fetch("/workers"), fetch("/jobs?limit=25"), fetch("/cron"),
+    ]);
+    const stats = await statsRes.json();
+    const workers = await workersRes.json();
+    const jobs = await jobsRes.json();
+    const cron = await cronRes.json();
+
+    renderDepth(stats.by_status || {});
+    renderWorkers(workers.workers || []);
+    renderJobs(jobs || []);
+    renderCron(cron || []);
+
+    clock.classList.remove("stale");
+    clockText.textContent = "actualizado " + new Date().toLocaleTimeString();
+  } catch (e) {
+    clock.classList.add("stale");
+    clockText.textContent = "sin conexión a la API";
+  }
+}
+
+function renderDepth(byStatus) {
+  const max = Math.max(1, ...Object.values(byStatus));
+  const grid = document.getElementById("depth-grid");
+  const statuses = STATUS_ORDER.filter(s => byStatus[s] !== undefined || true);
+  grid.innerHTML = statuses.map(s => {
+    const n = byStatus[s] || 0;
+    const pct = Math.round((n / max) * 100);
+    return `<div class="depth-cell st-${s}">
+      <div class="n">${n}</div>
+      <div class="label">${s}</div>
+      <div class="bar"><span style="width:${pct}%"></span></div>
+    </div>`;
+  }).join("");
+}
+
+function renderWorkers(workers) {
+  const body = document.getElementById("workers-body");
+  if (!workers.length) { body.innerHTML = `<tr><td class="empty" colspan="4">todavía no se registró ningún worker</td></tr>`; return; }
+  body.innerHTML = workers.map(w => `
+    <tr>
+      <td><span class="worker-dot ${w.alive ? "alive" : "dead"}"></span>${w.alive ? "vivo" : "caído"}</td>
+      <td>${esc(w.id)}</td>
+      <td>${w.concurrency}</td>
+      <td class="mono-dim">${timeAgo(w.started_at)}</td>
+    </tr>`).join("");
+}
+
+function renderCron(schedules) {
+  const body = document.getElementById("cron-body");
+  if (!schedules.length) { body.innerHTML = `<tr><td class="empty" colspan="3">sin cron schedules</td></tr>`; return; }
+  body.innerHTML = schedules.map(c => `
+    <tr>
+      <td>${esc(c.name)}</td>
+      <td class="mono-dim">${esc(c.cron_expr)}</td>
+      <td class="mono-dim">${new Date(c.next_run_at).toLocaleString()}</td>
+    </tr>`).join("");
+}
+
+function renderJobs(jobs) {
+  const body = document.getElementById("jobs-body");
+  if (!jobs.length) { body.innerHTML = `<tr><td class="empty" colspan="6">sin jobs todavía</td></tr>`; return; }
+  body.innerHTML = jobs.map(j => `
+    <tr>
+      <td><span class="badge ${j.status}">${j.status}</span></td>
+      <td class="id">${j.id.slice(0, 8)}</td>
+      <td>${esc(j.job_type)}</td>
+      <td class="mono-dim">${j.attempts}/${j.max_attempts}</td>
+      <td class="mono-dim">${j.worker_id ? esc(j.worker_id) : "-"}</td>
+      <td class="mono-dim">${timeAgo(j.created_at)}</td>
+    </tr>`).join("");
+}
+
+tick();
+setInterval(tick, 4000);
+</script>
+</body>
+</html>

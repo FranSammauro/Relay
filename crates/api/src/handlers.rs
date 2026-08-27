@@ -250,3 +250,77 @@ pub async fn delete_cron_schedule(
         Err(QueueError::NotFound(id).into())
     }
 }
+
+/// Fase 6: métricas en formato de exposición de Prometheus.
+///
+/// A propósito no hay contadores acumulados en memoria de proceso en
+/// ningún lado (ni acá ni en el worker). Todo se calcula al vuelo
+/// consultando Postgres, que ya es la fuente de verdad de todo lo demás
+/// (ADR-001): `job_attempts` funciona como el contador que solo crece
+/// (`_total`), y los percentiles de duración salen de una agregación SQL
+/// (`percentile_cont`) en vez de un histograma mantenido a mano. Esto
+/// significa que reiniciar la API o cualquier worker no pierde ninguna
+/// métrica -- están todas persistidas de entrada, no acumuladas aparte.
+pub async fn metrics(State(state): State<AppState>) -> Result<String, ApiError> {
+    let mut out = String::new();
+
+    let by_status = state.storage.count_by_status().await?;
+    out.push_str("# HELP queue_depth Number of jobs currently in each status\n");
+    out.push_str("# TYPE queue_depth gauge\n");
+    for row in &by_status {
+        out.push_str(&format!("queue_depth{{status=\"{}\"}} {}\n", row.status, row.count));
+    }
+
+    let by_outcome = state.storage.count_attempts_by_outcome().await?;
+    out.push_str("# HELP job_attempts_total Total job attempts by outcome\n");
+    out.push_str("# TYPE job_attempts_total counter\n");
+    for row in &by_outcome {
+        out.push_str(&format!("job_attempts_total{{outcome=\"{}\"}} {}\n", row.status, row.count));
+    }
+
+    let durations = state.storage.job_duration_percentiles().await?;
+    out.push_str("# HELP job_duration_seconds Job execution duration percentiles by job type\n");
+    out.push_str("# TYPE job_duration_seconds gauge\n");
+    for row in &durations {
+        if let Some(p50) = row.p50_seconds {
+            out.push_str(&format!(
+                "job_duration_seconds{{job_type=\"{}\",quantile=\"0.5\"}} {p50:.4}\n",
+                row.job_type
+            ));
+        }
+        if let Some(p95) = row.p95_seconds {
+            out.push_str(&format!(
+                "job_duration_seconds{{job_type=\"{}\",quantile=\"0.95\"}} {p95:.4}\n",
+                row.job_type
+            ));
+        }
+    }
+    out.push_str("# HELP job_duration_samples_total Sample count backing job_duration_seconds\n");
+    out.push_str("# TYPE job_duration_samples_total counter\n");
+    for row in &durations {
+        out.push_str(&format!(
+            "job_duration_samples_total{{job_type=\"{}\"}} {}\n",
+            row.job_type, row.sample_count
+        ));
+    }
+
+    let registered = state.storage.list_workers().await?;
+    let alive_count = state.heartbeats.list_alive().await?.len();
+    out.push_str("# HELP workers_registered Workers that have registered at some point\n");
+    out.push_str("# TYPE workers_registered gauge\n");
+    out.push_str(&format!("workers_registered {}\n", registered.len()));
+    out.push_str("# HELP workers_alive Workers currently sending heartbeats\n");
+    out.push_str("# TYPE workers_alive gauge\n");
+    out.push_str(&format!("workers_alive {alive_count}\n"));
+
+    Ok(out)
+}
+
+/// Fase 6: dashboard web mínimo. HTML+JS estático, sin build step ni
+/// dependencias nuevas -- hace polling de los endpoints que ya existen
+/// (`/stats`, `/workers`, `/jobs`) desde el navegador. Para un proyecto de
+/// este tamaño, un framework de frontend sería más superficie de
+/// mantenimiento que valor real.
+pub async fn dashboard() -> impl IntoResponse {
+    axum::response::Html(include_str!("../static/dashboard.html"))
+}

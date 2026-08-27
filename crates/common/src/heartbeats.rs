@@ -41,6 +41,17 @@ impl Heartbeats {
         Ok(())
     }
 
+    /// Fase 6: borra el heartbeat de un worker que se está bajando de
+    /// forma prolija. Sin esto, `GET /workers` seguiría mostrándolo como
+    /// "vivo" hasta que venza el TTL (hasta 3x `HEARTBEAT_INTERVAL_MS`) aun
+    /// cuando el worker ya cerró la conexión de manera ordenada y no hace
+    /// falta esperar nada.
+    pub async fn forget(&self, worker_id: &str) -> Result<(), QueueError> {
+        let mut conn = self.conn.clone();
+        conn.del::<_, ()>(heartbeat_key(worker_id)).await?;
+        Ok(())
+    }
+
     /// IDs de los workers que laten actualmente. `SCAN` en vez de `KEYS`
     /// para no bloquear Redis con un dataset grande -- acá con unos pocos
     /// workers da lo mismo, pero es el hábito correcto.

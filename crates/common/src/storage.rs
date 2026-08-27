@@ -5,8 +5,8 @@ use uuid::Uuid;
 
 use crate::error::QueueError;
 use crate::model::{
-    AttemptOutcome, CronSchedule, Job, JobAttempt, JobRow, NewCronSchedule, NewJob, StatusCount,
-    WorkerInfo,
+    AttemptOutcome, CronSchedule, Job, JobAttempt, JobDurationStats, JobRow, NewCronSchedule,
+    NewJob, StatusCount, WorkerInfo,
 };
 
 /// Columnas de `jobs` compartidas por casi todas las queries de este módulo.
@@ -397,6 +397,48 @@ impl Storage {
     pub async fn count_by_status(&self) -> Result<Vec<StatusCount>, QueueError> {
         let rows = sqlx::query_as::<_, StatusCount>(
             r#"SELECT status, COUNT(*) as count FROM jobs GROUP BY status"#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Conteo de intentos por resultado (`completed`/`failed`/`timeout`/
+    /// `lease_expired`). A diferencia de `count_by_status` (estado actual
+    /// de cada job), esto es un contador que solo crece -- sirve como
+    /// `_total` de Prometheus en `GET /metrics` sin necesitar acumular
+    /// nada en memoria del proceso (ver comentario en `handlers::metrics`).
+    pub async fn count_attempts_by_outcome(&self) -> Result<Vec<StatusCount>, QueueError> {
+        let rows = sqlx::query_as::<_, StatusCount>(
+            r#"
+            SELECT status, COUNT(*) as count
+            FROM job_attempts
+            WHERE status IS NOT NULL
+            GROUP BY status
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Percentiles de duración de attempts terminados, agrupados por tipo
+    /// de job. `percentile_cont` es una función de agregación estándar de
+    /// Postgres -- no hace falta mantener un histograma en memoria en
+    /// ningún proceso, la propia base lo calcula al vuelo.
+    pub async fn job_duration_percentiles(&self) -> Result<Vec<JobDurationStats>, QueueError> {
+        let rows = sqlx::query_as::<_, JobDurationStats>(
+            r#"
+            SELECT
+                j.job_type,
+                percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (a.finished_at - a.started_at))) AS p50_seconds,
+                percentile_cont(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (a.finished_at - a.started_at))) AS p95_seconds,
+                COUNT(*) AS sample_count
+            FROM job_attempts a
+            JOIN jobs j ON j.id = a.job_id
+            WHERE a.finished_at IS NOT NULL
+            GROUP BY j.job_type
+            "#,
         )
         .fetch_all(&self.pool)
         .await?;
