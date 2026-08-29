@@ -7,7 +7,7 @@ use uuid::Uuid;
 /// Transiciones válidas (resumen):
 ///   pending -> running -> completed
 ///   pending -> running -> failed -> retry_scheduled -> pending
-///   pending -> running -> failed -> dead_letter   (max_attempts agotado)
+///   pending -> running -> failed -> dead_letter (max_attempts agotado)
 ///   pending -> cancelled
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -155,18 +155,20 @@ fn default_timeout_seconds() -> i32 {
     30
 }
 
-/// Resultado de un intento de ejecución, tal como queda en `job_attempts`.
-/// `TimedOut` es un caso particular de fallo -- cuenta contra max_attempts
-/// igual que cualquier otro error, pero vale la pena distinguirlo en el
-/// historial porque diagnosticar "se colgó" es distinto a "tiró excepción".
+/// Resultado de un intento de ejecución, tal como queda registrado en
+/// `job_attempts`. `TimedOut` representa un caso particular de fallo: se
+/// contabiliza contra max_attempts igual que cualquier otro error, pero
+/// se distingue en el historial porque diagnosticar un job que se colgó
+/// requiere un análisis distinto al de una excepción explícita.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttemptOutcome {
     Completed,
     Failed,
     TimedOut,
-    /// Fase 4: el worker que tenía el job dejó de responder y su lease
-    /// venció. No sabemos si el proceso murió del todo o solo se colgó --
-    /// solo que dejó de cumplir su promesa de terminar a tiempo.
+    /// Fase 4: el worker que tenía asignado el job dejó de responder y su
+    /// lease venció. No es posible determinar si el proceso finalizó por
+    /// completo o simplemente quedó colgado, solo que dejó de cumplir su
+    /// compromiso de finalizar a tiempo.
     LeaseExpired,
 }
 
@@ -194,7 +196,8 @@ pub struct JobAttempt {
     pub error: Option<String>,
 }
 
-/// Fila de la tabla `workers` (Fase 2: solo registro, sin heartbeat todavía).
+/// Fila de la tabla `workers`. Desde la Fase 2 solo constituye un
+/// registro; el mecanismo de heartbeat se incorpora en la Fase 4.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct WorkerInfo {
     pub id: String,
@@ -203,7 +206,8 @@ pub struct WorkerInfo {
 }
 
 /// Conteo de jobs agrupados por estado, para el endpoint de stats.
-/// No es Prometheus todavía (eso es Fase 6), pero da la misma info en JSON.
+/// No corresponde al formato Prometheus, que se incorpora en la Fase 6,
+/// pero expone la misma información en JSON.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct StatusCount {
     pub status: String,
@@ -219,9 +223,9 @@ pub struct JobDurationStats {
     pub sample_count: i64,
 }
 
-/// Fase 5: fila de `cron_schedules`. Es la "plantilla" de un job
-/// recurrente -- cada disparo crea una fila normal en `jobs`, no hay un
-/// tipo de ejecución especial para esto.
+/// Fase 5: fila de `cron_schedules`. Representa la plantilla de un job
+/// recurrente; cada disparo crea una fila normal en `jobs`, sin que
+/// exista un tipo de ejecución especial para este caso.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct CronSchedule {
     pub id: Uuid,
@@ -238,9 +242,10 @@ pub struct CronSchedule {
     pub created_at: DateTime<Utc>,
 }
 
-/// Datos para crear un cron schedule nuevo. `next_run_at` no está acá a
-/// propósito -- lo calcula `Storage::create_cron_schedule` a partir de
-/// `cron_expr`, no lo elige quien llama.
+/// Datos para crear un cron schedule nuevo. `next_run_at` no forma parte
+/// de esta estructura de forma intencional: lo calcula
+/// `Storage::create_cron_schedule` a partir de `cron_expr`, en lugar de
+/// ser elegido por quien invoca el método.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NewCronSchedule {
     pub name: String,
@@ -255,4 +260,17 @@ pub struct NewCronSchedule {
     pub max_attempts: i32,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: i32,
+}
+
+/// Fila cruda para el benchmark de la Fase 7: los tres timestamps que
+/// permiten reconstruir la latencia de cola (created_at a started_at) y
+/// la latencia de ejecución (started_at a completed_at) de cada job.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct BenchTimestamps {
+    pub id: Uuid,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub failed_at: Option<DateTime<Utc>>,
 }

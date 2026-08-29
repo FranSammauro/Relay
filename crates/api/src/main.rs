@@ -59,9 +59,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(event = "api_starting", %addr, "starting job queue API");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    // Fase 6: graceful shutdown -- terminamos requests en vuelo antes de
-    // cerrar en vez de cortar la conexión a media respuesta cuando llega
-    // SIGTERM (Docker/Kubernetes lo mandan al bajar el contenedor).
+    // Fase 6: graceful shutdown. Las requests en curso finalizan antes de
+    // cerrar el servidor, en lugar de interrumpir la conexión a mitad de
+    // una respuesta cuando llega SIGTERM (la señal que Docker o
+    // Kubernetes envían al detener el contenedor).
     axum::serve(listener, app)
         .with_graceful_shutdown(common::shutdown::signal())
         .await?;

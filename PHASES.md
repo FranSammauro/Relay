@@ -51,10 +51,11 @@
 - [x] Graceful shutdown (SIGTERM/Ctrl+C compartido en `common::shutdown`; API drena requests en vuelo, worker deja de reclamar y espera a que terminen los jobs en curso con un plazo de `SHUTDOWN_GRACE_SECONDS` antes de salir, y limpia su heartbeat de Redis al bajar)
 - [x] Validado manualmente de punta a punta: SIGTERM real a mitad de un job de 8s — el worker esperó a que terminara completo antes de cerrar
 
-## ⬜ Fase 7 — Performance
-- [ ] Benchmarks reproducibles (submission/queue/execution latency)
-- [ ] Profiling y optimización de índices
-- [ ] Análisis de cuellos de botella
+## ✅ Fase 7 — Performance
+- [x] Benchmarks reproducibles (`queue-cli bench`, mide latencia de envío/cola/ejecución con datos reales, no estimados)
+- [x] Profiling de índices (`EXPLAIN ANALYZE` sobre claim_next_job, reap_expired_leases y count_by_status)
+- [x] Análisis de cuellos de botella — ver `docs/performance.md` para el informe completo con metodología y datos reales
+- [x] Hallazgo real documentado: `claim_next_job` bajo backlog sostenido con `status IN (...)` materializa todas las filas candidatas antes de ordenar (hasta 170x más lento que la variante de un solo status en el escenario sintético de 20k filas pending); optimización identificada y documentada, pendiente de decisión deliberada por el trade-off de prioridad entre `pending` y `retry_scheduled` que introduce
 
 ## ⬜ Fase 8 — Production Polish
 - [ ] Autenticación (API keys) y autorización (producer/worker/admin)

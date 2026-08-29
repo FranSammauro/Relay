@@ -1,19 +1,21 @@
-//! Parser de expresiones cron minimalista, hecho a mano.
+//! Parser de expresiones cron implementado manualmente.
 //!
-//! Deliberadamente NO usamos la crate `cron` de crates.io: ya nos comimos
-//! suficientes vueltas de pines de versión por el tema del rustc viejo (ver
-//! comentarios en Cargo.toml) como para sumar una dependencia más solo para
-//! resolver un problema chico y bien acotado. Calcular "próxima vez que
-//! matchea esta expresión" es un ejercicio de una tarde, no una pieza de
-//! infraestructura -- y tenerlo acá adentro significa que no hay que volver
-//! a pelear con MSRV cada vez que esa crate suba de versión.
+//! Se decidió no utilizar la crate `cron` de crates.io. El proyecto ya
+//! tuvo que fijar versiones de varias dependencias transitivas por
+//! incompatibilidades con el rustc antiguo del entorno (ver comentarios en
+//! Cargo.toml), y sumar una dependencia externa para resolver un problema
+//! acotado no se justifica. Calcular la próxima ocurrencia de una
+//! expresión cron es un problema bien delimitado y de alcance reducido.
+//! Mantenerlo en el propio código evita además futuros conflictos de MSRV
+//! si esa crate actualiza su versión mínima de Rust soportada.
 //!
-//! Soporta el formato estándar de 5 campos (sin segundos):
-//! `minuto hora dia-del-mes mes dia-de-semana`, con `*`, listas (`1,2,3`),
-//! rangos (`1-5`) y pasos (`*/15`, `1-30/5`). No soporta alias de texto
-//! (`JAN`, `MON`) ni las extensiones no estándar (`@daily`, `L`, `W`, `#`)
-//! -- si hace falta eso, ahí sí vale la pena traer una crate hecha y
-//! derecha en vez de seguir haciendo crecer esto a mano.
+//! Soporta el formato estándar de 5 campos, sin segundos:
+//! `minuto hora dia-del-mes mes dia-de-semana`, con soporte para `*`,
+//! listas (`1,2,3`), rangos (`1-5`) y pasos (`*/15`, `1-30/5`). No soporta
+//! alias de texto (`JAN`, `MON`) ni las extensiones no estándar (`@daily`,
+//! `L`, `W`, `#`). Si en algún momento se requiere ese soporte, es
+//! preferible incorporar una crate especializada en lugar de extender este
+//! parser.
 
 use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
 use std::fmt;
@@ -31,8 +33,8 @@ impl std::error::Error for CronError {}
 
 #[derive(Debug, Clone)]
 struct Field {
-    // bitset de valores válidos. 64 bits alcanza y sobra para cualquiera de
-    // los 5 campos (el más grande, día del mes, llega a 31).
+    // Bitset de valores válidos. 64 bits son suficientes para cualquiera
+    // de los 5 campos; el mayor, día del mes, llega hasta 31.
     allowed: u64,
 }
 
@@ -93,9 +95,10 @@ pub struct CronExpr {
     day_of_week: Field,
 }
 
-/// Techo de búsqueda hacia adelante: si en 4 años no encontramos una
-/// ocurrencia, la expresión es irrealizable (ej: 31 de febrero) y es mejor
-/// devolver None de forma explícita que loopear para siempre.
+/// Límite superior de búsqueda hacia adelante. Si en 4 años no se
+/// encuentra una ocurrencia, la expresión es irrealizable (por ejemplo,
+/// 31 de febrero); en ese caso es preferible devolver None de forma
+/// explícita que iterar indefinidamente.
 const MAX_LOOKAHEAD_MINUTES: i64 = 4 * 365 * 24 * 60;
 
 impl CronExpr {
@@ -113,19 +116,22 @@ impl CronExpr {
             hour: Field::parse(fields[1], 0, 23)?,
             day_of_month: Field::parse(fields[2], 1, 31)?,
             month: Field::parse(fields[3], 1, 12)?,
-            // domingo=0 igual que cron estándar (0 y 7 son ambos domingo,
-            // pero para simplificar solo aceptamos 0-6 -- documentado).
+            // El domingo se representa como 0, igual que en cron estándar
+            // (0 y 7 corresponden ambos a domingo, pero por simplicidad
+            // este parser solo acepta el rango 0-6).
             day_of_week: Field::parse(fields[4], 0, 6)?,
         })
     }
 
-    /// Próxima vez que la expresión matchea, estrictamente después de
-    /// `after`. Escanea minuto a minuto -- nada elegante, pero para un
-    /// scheduler que corre cada `SCHEDULER_INTERVAL_MS` (segundos, no
-    /// microsegundos) esto no es un hot path que necesite ser inteligente.
+    /// Devuelve la próxima fecha en que la expresión coincide,
+    /// estrictamente posterior a `after`. La búsqueda se realiza minuto a
+    /// minuto: no es el algoritmo más eficiente posible, pero dado que el
+    /// scheduler invoca esta función cada `SCHEDULER_INTERVAL_MS`
+    /// (del orden de segundos, no microsegundos), no constituye una ruta
+    /// crítica que requiera optimización adicional.
     pub fn next_after(&self, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        // arrancamos en el próximo minuto exacto, sin segundos/nanos --
-        // cron no tiene resolución de segundos.
+        // Se parte del próximo minuto exacto, sin segundos ni nanosegundos,
+        // ya que cron no tiene resolución de segundos.
         let start = (after + Duration::minutes(1))
             .with_second(0)
             .unwrap()
@@ -143,9 +149,10 @@ impl CronExpr {
     }
 
     fn matches(&self, dt: DateTime<Utc>) -> bool {
-        // día del mes y día de semana: si ambos están restringidos (no son
-        // "*"), cron estándar los trata como OR, no AND -- así es como lo
-        // interpreta vixie-cron y es la convención que la gente espera.
+        // El día del mes y el día de la semana se combinan con OR, no con
+        // AND, cuando ambos están restringidos (ninguno es "*"). Esta es
+        // la convención estándar de cron, adoptada originalmente por
+        // vixie-cron y esperada por los usuarios.
         let dom_wildcard = self.day_of_month.allowed == full_mask(1, 31);
         let dow_wildcard = self.day_of_week.allowed == full_mask(0, 6);
 
@@ -216,7 +223,7 @@ mod tests {
 
     #[test]
     fn specific_weekday() {
-        // lunes a las 9:00 -- 2026-01-01 es jueves
+        // lunes a las 9:00. El 2026-01-01 es jueves.
         let s = CronExpr::parse("0 9 * * 1").unwrap();
         let next = s.next_after(dt(2026, 1, 1, 0, 0)).unwrap();
         assert_eq!(next.weekday().num_days_from_sunday(), 1);
@@ -249,9 +256,9 @@ mod tests {
 
     #[test]
     fn day_of_month_and_day_of_week_are_or_when_both_restricted() {
-        // día 1 del mes, O lunes -- convención estándar de cron
+        // Día 1 del mes, o lunes: convención estándar de cron.
         let s = CronExpr::parse("0 0 1 * 1").unwrap();
-        // 2026-01-05 es lunes pero no es día 1 -- debería matchear igual
+        // El 2026-01-05 es lunes pero no es día 1; de todas formas debe coincidir.
         let next = s.next_after(dt(2026, 1, 2, 0, 0)).unwrap();
         assert_eq!(next, dt(2026, 1, 5, 0, 0));
     }

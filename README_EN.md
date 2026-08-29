@@ -169,8 +169,18 @@ cargo run -p queue-cli -- jobs list --status dead_letter
 cargo run -p queue-cli -- jobs attempts <id>
 cargo run -p queue-cli -- stats
 cargo run -p queue-cli -- cron create --name daily-report --expr "0 6 * * *" --type generate_report
+cargo run -p queue-cli -- bench --jobs 1000 --type noop
 cargo run -p queue-cli -- --help
 ```
+
+### Benchmarks and performance
+
+`queue-cli bench` measures submission, queue, and execution latency with
+real data (not estimated), and requires at least one worker running
+against the same database. See
+[`docs/performance.md`](./docs/performance.md) for the full report, with
+a reproducible methodology and a real finding about an index under
+sustained backlog.
 
 ### Running locally without Docker
 

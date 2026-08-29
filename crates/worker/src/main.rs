@@ -31,9 +31,10 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(500),
     );
 
-    // Cuantos jobs corre este worker en paralelo. Fijo por config en Fase 2 --
-    // nada de auto-scaling ni tuning dinámico todavía, eso sería resolver un
-    // problema que ni siquiera tenemos planteado bien.
+    // Cantidad de jobs que este worker ejecuta en paralelo. Es un valor
+    // fijo por configuración desde la Fase 2; no existe auto-scaling ni
+    // ajuste dinámico, ya que ese problema no está planteado en el
+    // alcance actual del proyecto.
     let concurrency: usize = std::env::var("CONCURRENCY")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -65,11 +66,11 @@ async fn main() -> anyhow::Result<()> {
         "starting worker"
     );
 
-    // Fase 6: canal de shutdown gracioso. Una sola señal (SIGTERM o
-    // Ctrl+C) avisa a todo lo que le importa que hay que empezar a
-    // terminar en vez de cortar en seco -- el loop principal deja de
-    // reclamar jobs nuevos, y más abajo esperamos a que los que ya están
-    // en vuelo terminen antes de salir del proceso.
+    // Fase 6: canal de shutdown ordenado. Una única señal (SIGTERM o
+    // Ctrl+C) notifica a todas las tareas que corresponde iniciar el
+    // cierre en lugar de interrumpir abruptamente. El ciclo principal deja
+    // de reclamar jobs nuevos, y a continuación se espera a que los que ya
+    // estaban en ejecución finalicen antes de terminar el proceso.
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         common::shutdown::signal().await;
@@ -77,10 +78,11 @@ async fn main() -> anyhow::Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    // Fase 4: heartbeat propio, corriendo en su propia tarea de fondo. Late
-    // cada heartbeat_interval con un TTL de 3x ese intervalo en Redis -- si
-    // el worker deja de latir (se cuelga, muere, pierde la red), la clave
-    // expira sola sin que nadie tenga que barrerla a mano (ver
+    // Fase 4: heartbeat propio, ejecutado en su propia tarea de fondo.
+    // Se emite cada heartbeat_interval con un TTL igual a tres veces ese
+    // intervalo en Redis. Si el worker deja de emitir el heartbeat (se
+    // cuelga, finaliza, o pierde conectividad de red), la clave expira
+    // automáticamente sin que sea necesario limpiarla manualmente (ver
     // common::heartbeats y ADR-002).
     {
         let heartbeats = heartbeats.clone();
@@ -96,11 +98,12 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Fase 4: el reaper. Corre en todos los workers a la vez a propósito
-    // (ver ADR-004) -- así la recuperación de jobs abandonados no depende
-    // de que un único "coordinador" siga vivo. El costo es un poco de
-    // polling redundante entre workers; a esta escala es gratis comparado
-    // con el beneficio de no tener un punto único de falla para el recovery.
+    // Fase 4: el reaper. Se ejecuta simultáneamente en todos los workers
+    // de forma deliberada (ver ADR-004), de modo que la recuperación de
+    // jobs abandonados no dependa de que un único coordinador permanezca
+    // activo. El costo es cierto polling redundante entre workers; a esta
+    // escala resulta despreciable frente al beneficio de eliminar un
+    // punto único de falla para la recuperación.
     {
         let storage = storage.clone();
         tokio::spawn(async move {
@@ -126,10 +129,11 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Fase 5: scheduler de cron, con exclusión mutua vía advisory lock de
-    // Postgres (ver ADR-006). Cada worker intenta ser el líder; el que lo
-    // consigue corre el loop de "disparar lo que esté vencido"; el resto
-    // reintenta cada scheduler_interval por si el líder actual se cae.
+    // Fase 5: scheduler de cron, con exclusión mutua mediante advisory
+    // lock de PostgreSQL (ver ADR-006). Cada worker intenta convertirse en
+    // líder; el que lo consigue ejecuta el ciclo de disparo de los
+    // schedules vencidos, mientras el resto reintenta cada
+    // scheduler_interval por si el líder actual deja de estar disponible.
     let scheduler_interval = Duration::from_millis(
         std::env::var("SCHEDULER_INTERVAL_MS")
             .ok()
@@ -144,22 +148,24 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Fase 2: loop de claim que dispara ejecuciones en paralelo, con un
-    // semáforo como único freno de mano. La idea es simple a propósito:
-    // pedimos un permiso, reclamamos un job, lo largamos en su propia
-    // tarea, y seguimos pidiendo mientras haya permisos libres. El permiso
-    // se libera solo cuando el job termina (el `Arc<Semaphore>` clonado
-    // dentro de la tarea hace ese trabajo sucio).
+    // Fase 2: ciclo de claim que dispara ejecuciones en paralelo,
+    // utilizando un semáforo como único mecanismo de control de
+    // concurrencia. El flujo es intencionalmente simple: se solicita un
+    // permiso, se reclama un job, se lanza en su propia tarea, y se
+    // continúa solicitando mientras haya permisos disponibles. El permiso
+    // se libera únicamente cuando el job finaliza (el `Arc<Semaphore>`
+    // clonado dentro de la tarea es responsable de esa liberación).
     let semaphore = Arc::new(Semaphore::new(concurrency));
 
     loop {
-        // acquire_owned nos deja mover el permiso adentro del spawn sin
-        // pelearnos con lifetimes -- si no está disponible, se queda acá
-        // esperando, que es exactamente el comportamiento que queremos:
-        // no reclamar más trabajo del que podemos correr. El select! de
-        // acá afuera es lo único nuevo en Fase 6: si llega la señal de
-        // shutdown mientras esperamos un permiso libre, cortamos el loop
-        // en vez de seguir pidiendo trabajo nuevo.
+        // acquire_owned permite mover el permiso dentro del spawn sin
+        // conflictos de lifetimes. Si no hay permisos disponibles, la
+        // ejecución permanece a la espera, que es el comportamiento
+        // deseado: no se reclama más trabajo del que el worker puede
+        // procesar. El select! agregado en la Fase 6 es la única
+        // modificación sobre este comportamiento: si llega la señal de
+        // shutdown mientras se espera un permiso libre, se interrumpe el
+        // ciclo en lugar de continuar solicitando trabajo nuevo.
         let permit = tokio::select! {
             _ = shutdown_rx.changed() => break,
             permit = semaphore.clone().acquire_owned() => permit?,
@@ -175,10 +181,11 @@ async fn main() -> anyhow::Result<()> {
                 });
             }
             Ok(None) => {
-                // no había nada para reclamar, devolvemos el permiso y
-                // esperamos el poll_interval como en Fase 1 -- salvo que
-                // llegue el shutdown mientras tanto, en cuyo caso no tiene
-                // sentido seguir esperando para volver a preguntar lo mismo.
+                // No había nada para reclamar; se devuelve el permiso y se
+                // espera poll_interval, como en la Fase 1, salvo que
+                // llegue la señal de shutdown mientras tanto, en cuyo caso
+                // no corresponde seguir esperando para repetir la misma
+                // consulta.
                 drop(permit);
                 tokio::select! {
                     _ = shutdown_rx.changed() => break,
@@ -196,15 +203,16 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Ya no reclamamos jobs nuevos. Lo único que falta es no dejar tirados
-    // a medio terminar los que ya estaban en vuelo -- esperamos a que se
-    // liberen todos los permisos del semáforo (cada tarea de job los
-    // suelta al terminar), con un techo de `SHUTDOWN_GRACE_SECONDS` por si
-    // alguno se está colgando. Si el plazo se cumple igual salimos: esos
-    // jobs van a quedar con el lease corriendo y el reaper de cualquier
-    // otro worker los va a recuperar solo (Fase 4, ADR-004) -- graceful
-    // shutdown no es una promesa de esperar para siempre, es evitar el
-    // caso común de matar un job a mitad de camino sin necesidad.
+    // Ya no se reclaman jobs nuevos. Resta evitar que los jobs que ya
+    // estaban en ejecución queden interrumpidos a mitad de camino: se
+    // espera a que se liberen todos los permisos del semáforo (cada tarea
+    // de job libera el suyo al finalizar), con un límite de tiempo
+    // definido por `SHUTDOWN_GRACE_SECONDS` por si alguno queda colgado.
+    // Si el plazo se cumple, el proceso finaliza de todas formas: esos
+    // jobs quedarán con el lease activo y serán recuperados por el reaper
+    // de cualquier otro worker (Fase 4, ADR-004). El graceful shutdown no
+    // constituye una garantía de espera indefinida, sino un mecanismo para
+    // evitar el caso común de interrumpir un job sin necesidad.
     let shutdown_grace = Duration::from_secs(
         std::env::var("SHUTDOWN_GRACE_SECONDS")
             .ok()
@@ -256,10 +264,12 @@ async fn run_job(storage: &Storage, worker_id: &str, job: Job) {
         "job execution started"
     );
 
-    // Fase 3: el handler corre bajo un timeout duro. Si se pasa, lo tratamos
-    // como un fallo más (cuenta contra max_attempts igual que una excepción),
-    // pero lo distinguimos en job_attempts como 'timeout' porque diagnosticar
-    // un job colgado es un problema distinto a uno que explotó rápido.
+    // Fase 3: el handler se ejecuta bajo un timeout estricto. Si se
+    // excede, se trata como un fallo adicional, que cuenta contra
+    // max_attempts igual que cualquier otra excepción, pero se distingue
+    // en job_attempts con el valor 'timeout', ya que diagnosticar un job
+    // colgado requiere un análisis distinto al de uno que falló de
+    // inmediato.
     let timeout = Duration::from_secs(job.timeout_seconds.max(1) as u64);
     let outcome = tokio::time::timeout(timeout, handlers::execute(&job.job_type, &job.payload)).await;
     let duration_ms = started.elapsed().as_millis();
@@ -306,9 +316,10 @@ async fn record_failure(
         }
     };
 
-    // Un solo evento para ambos desenlaces, distinguido por result_status --
-    // así un grep de "job_attempt_failed" te da el cuadro completo sin tener
-    // que acordarte de dos nombres de evento distintos.
+    // Se emite un único evento para ambos desenlaces, distinguido por
+    // result_status. De esta forma, una búsqueda de "job_attempt_failed"
+    // en los logs proporciona el cuadro completo sin necesidad de conocer
+    // dos nombres de evento distintos.
     tracing::warn!(
         event = "job_attempt_failed",
         job_id = %job.id,
@@ -324,11 +335,12 @@ async fn record_failure(
     );
 }
 
-/// Intenta ser el líder del scheduler de cron; si lo consigue, corre el
-/// loop de disparo hasta perder el lock (la conexión se cae, el proceso se
-/// muere, lo que sea). Si no lo consigue, simplemente reintenta más tarde
-/// -- esto es polling barato: `pg_try_advisory_lock` es no bloqueante y no
-/// pelea con nadie por filas ni índices.
+/// Intenta convertirse en líder del scheduler de cron. Si lo consigue,
+/// ejecuta el ciclo de disparo hasta perder el lock, ya sea porque la
+/// conexión se interrumpe o porque el proceso finaliza. Si no lo
+/// consigue, simplemente reintenta más adelante: se trata de polling de
+/// bajo costo, dado que `pg_try_advisory_lock` es no bloqueante y no
+/// compite por filas ni índices.
 async fn run_scheduler_loop(storage: Storage, worker_id: &str, interval: Duration) {
     loop {
         match storage.try_become_scheduler_leader().await {
@@ -338,10 +350,11 @@ async fn run_scheduler_loop(storage: Storage, worker_id: &str, interval: Duratio
                     worker_id = %worker_id,
                     "acquired cron scheduler leadership"
                 );
-                // mantenemos la conexión viva (el lock es de sesión, se
-                // libera solo si soltamos esta conexión puntual) mientras
-                // dure el liderazgo. Si algo la tira abajo, salimos del
-                // loop interno y volvemos a intentar ser líder más arriba.
+                // Se mantiene la conexión activa mientras dure el
+                // liderazgo, ya que el lock es de sesión y se libera
+                // únicamente al soltar esta conexión en particular. Si la
+                // conexión se interrumpe, se sale del ciclo interno y se
+                // reintenta el liderazgo en la iteración superior.
                 run_as_leader(&storage, worker_id, interval, leader_conn).await;
                 tracing::warn!(
                     event = "scheduler_leader_lost",
@@ -350,7 +363,7 @@ async fn run_scheduler_loop(storage: Storage, worker_id: &str, interval: Duratio
                 );
             }
             Ok(None) => {
-                // otro worker ya es líder, no hay nada para hacer.
+                // Otro worker ya ostenta el liderazgo; no hay ninguna acción que realizar.
             }
             Err(e) => {
                 tracing::error!(event = "scheduler_leader_check_failed", error = %e, "failed to check scheduler leadership");
@@ -367,9 +380,10 @@ async fn run_as_leader(
     mut leader_conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
 ) {
     loop {
-        // Un SELECT 1 trivial sobre la conexión que sostiene el advisory
-        // lock: si el link con Postgres se cortó, esto falla y soltamos el
-        // liderazgo en vez de seguir actuando como líder a ciegas.
+        // Se ejecuta un SELECT 1 trivial sobre la conexión que sostiene el
+        // advisory lock: si la conexión con PostgreSQL se interrumpió,
+        // esta consulta falla, y se libera el liderazgo en lugar de
+        // continuar actuando como líder sin una conexión válida.
         if sqlx::query("SELECT 1").execute(&mut *leader_conn).await.is_err() {
             return;
         }

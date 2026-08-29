@@ -29,10 +29,12 @@ impl IntoResponse for ApiError {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".to_string())
             }
             QueueError::Redis(_) => {
-                // Redis acá es coordinación efímera (ver ADR-002), no fuente
-                // de verdad -- si está caído, el endpoint que lo necesita no
-                // puede contestar bien, pero no es un 500 de "algo se rompió
-                // adentro", es un 503 de "una dependencia externa no está".
+                // En este contexto, Redis representa coordinación efímera
+                // (ver ADR-002), no una fuente de verdad. Si no está
+                // disponible, el endpoint que lo requiere no puede
+                // responder correctamente, pero esto no constituye un
+                // error interno del servicio (500), sino la ausencia de
+                // una dependencia externa (503).
                 tracing::error!(error = %self.0, "redis error handling request");
                 (StatusCode::SERVICE_UNAVAILABLE, "liveness backend unavailable".to_string())
             }
@@ -105,15 +107,16 @@ pub async fn get_job(
     Ok(Json(job))
 }
 
-/// Fase 3: historial de intentos de un job (uno por cada vez que un worker
-/// lo agarró). Útil para responder "¿por qué falló esto tres veces?" sin
-/// tener que grepear logs de tres workers distintos.
+/// Fase 3: historial de intentos de un job, con un registro por cada vez
+/// que un worker lo tomó. Permite responder por qué un job falló
+/// determinada cantidad de veces sin necesidad de revisar los logs de
+/// varios workers distintos.
 pub async fn get_job_attempts(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<common::JobAttempt>>, ApiError> {
-    // si el job no existe directamente devolvemos 404 en vez de una lista
-    // vacía silenciosa -- es más útil para debuggear un id mal copiado.
+    // Si el job no existe, se devuelve 404 en lugar de una lista vacía de
+    // forma silenciosa; resulta más útil al depurar un id incorrecto.
     state.storage.get_job(id).await?.ok_or(QueueError::NotFound(id))?;
 
     let attempts = state.storage.list_attempts(id).await?;
@@ -165,12 +168,13 @@ pub async fn stats(State(state): State<AppState>) -> Result<Json<serde_json::Val
     Ok(Json(serde_json::json!({ "by_status": by_status })))
 }
 
-/// Fase 4: junta dos fuentes con roles distintos (ver ADR-002). El registro
-/// en Postgres (`workers`, desde Fase 2) dice quién existió alguna vez; el
-/// heartbeat en Redis dice quién está respondiendo ahora mismo. Ninguna de
-/// las dos por sí sola contesta "¿quién está vivo?" -- la tabla no sabe si
-/// un worker murió hace una hora, y Redis no tiene historial de nadie que
-/// ya expiró.
+/// Fase 4: combina dos fuentes con roles distintos (ver ADR-002). El
+/// registro en PostgreSQL (`workers`, desde la Fase 2) indica quién
+/// existió en algún momento; el heartbeat en Redis indica quién está
+/// respondiendo en este instante. Ninguna de las dos fuentes responde por
+/// sí sola a la pregunta de quién está activo: la tabla no distingue si un
+/// worker finalizó hace una hora, y Redis no conserva historial de
+/// heartbeats ya expirados.
 pub async fn list_workers(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let registered = state.storage.list_workers().await?;
     let alive: std::collections::HashSet<String> =
@@ -192,9 +196,10 @@ pub async fn list_workers(State(state): State<AppState>) -> Result<Json<serde_js
     Ok(Json(serde_json::json!({ "workers": workers })))
 }
 
-/// Fase 5: crea un cron schedule. Valida la expresión al vuelo -- una
-/// expresión inválida vuelve como 400, no como un schedule roto que recién
-/// falla cuando el scheduler intenta usarlo por primera vez.
+/// Fase 5: crea un cron schedule. La expresión se valida inmediatamente:
+/// una expresión inválida devuelve un 400 en el momento de la creación, en
+/// lugar de generar un schedule inconsistente que solo fallaría cuando el
+/// scheduler intentara utilizarlo por primera vez.
 pub async fn create_cron_schedule(
     State(state): State<AppState>,
     Json(new): Json<NewCronSchedule>,
@@ -253,14 +258,16 @@ pub async fn delete_cron_schedule(
 
 /// Fase 6: métricas en formato de exposición de Prometheus.
 ///
-/// A propósito no hay contadores acumulados en memoria de proceso en
-/// ningún lado (ni acá ni en el worker). Todo se calcula al vuelo
-/// consultando Postgres, que ya es la fuente de verdad de todo lo demás
-/// (ADR-001): `job_attempts` funciona como el contador que solo crece
-/// (`_total`), y los percentiles de duración salen de una agregación SQL
-/// (`percentile_cont`) en vez de un histograma mantenido a mano. Esto
-/// significa que reiniciar la API o cualquier worker no pierde ninguna
-/// métrica -- están todas persistidas de entrada, no acumuladas aparte.
+/// De forma deliberada, no existen contadores acumulados en memoria de
+/// proceso en ningún componente, ni en la API ni en el worker. Todo se
+/// calcula en el momento de la consulta directamente sobre PostgreSQL, que
+/// ya constituye la fuente de verdad del resto del sistema (ADR-001):
+/// `job_attempts` cumple el rol del contador monótono (`_total`), y los
+/// percentiles de duración se obtienen mediante una agregación SQL
+/// (`percentile_cont`) en lugar de un histograma mantenido manualmente.
+/// Como consecuencia, reiniciar la API o cualquier worker no implica la
+/// pérdida de ninguna métrica, ya que todas están persistidas desde su
+/// origen y no se acumulan por separado.
 pub async fn metrics(State(state): State<AppState>) -> Result<String, ApiError> {
     let mut out = String::new();
 
@@ -316,11 +323,11 @@ pub async fn metrics(State(state): State<AppState>) -> Result<String, ApiError> 
     Ok(out)
 }
 
-/// Fase 6: dashboard web mínimo. HTML+JS estático, sin build step ni
-/// dependencias nuevas -- hace polling de los endpoints que ya existen
-/// (`/stats`, `/workers`, `/jobs`) desde el navegador. Para un proyecto de
-/// este tamaño, un framework de frontend sería más superficie de
-/// mantenimiento que valor real.
+/// Fase 6: dashboard web mínimo. Consiste en HTML y JavaScript estáticos,
+/// sin paso de build ni dependencias nuevas, que realizan polling sobre
+/// los endpoints existentes (`/stats`, `/workers`, `/jobs`) desde el
+/// navegador. Para un proyecto de este tamaño, introducir un framework de
+/// frontend representaría más superficie de mantenimiento que valor real.
 pub async fn dashboard() -> impl IntoResponse {
     axum::response::Html(include_str!("../static/dashboard.html"))
 }

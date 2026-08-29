@@ -1,29 +1,30 @@
-//! Test de recovery (Fase 4): simula un worker que agarra un job y
-//! desaparece sin avisar (kill -9, OOM, lo que sea) -- nunca llama a
-//! mark_completed ni a record_failure. El lease vence solo, y el reaper
-//! tiene que recuperar el job aplicando la misma política de retry/DLQ
-//! que un fallo reportado normalmente.
+//! Test de recuperación (Fase 4): simula un worker que reclama un job y
+//! desaparece sin notificar (kill -9, OOM, o cualquier otra causa), sin
+//! llegar a invocar mark_completed ni record_failure. El lease vence por
+//! sí solo, y el reaper debe recuperar el job aplicando la misma política
+//! de reintento o dead-letter que un fallo reportado normalmente.
 //!
-//! A propósito, este test NO usa Redis -- y esa es la validación más
-//! importante de ADR-002: la recuperación de jobs abandonados corre
-//! enteramente sobre Postgres. Si Redis estuviera en el camino crítico acá,
-//! este test no podría existir sin levantar dos servicios en vez de uno.
+//! Este test no utiliza Redis de forma deliberada, y esa omisión
+//! constituye la validación más importante de ADR-002: la recuperación de
+//! jobs abandonados se ejecuta enteramente sobre PostgreSQL. Si Redis
+//! formara parte del camino crítico en este punto, este test no podría
+//! existir sin levantar dos servicios en lugar de uno.
 //!
-//! Dos cosas sobre aislamiento, porque `reap_expired_leases` es
-//! deliberadamente global (barre TODA la tabla, no un job puntual -- así
-//! tiene que ser en producción, un reaper real no sabe de antemano qué
-//! buscar):
+//! Corresponden dos aclaraciones sobre aislamiento, dado que
+//! `reap_expired_leases` es deliberadamente global (recorre toda la
+//! tabla, no un job puntual, ya que así debe comportarse en producción: un
+//! reaper real no conoce de antemano qué job buscar):
 //!
-//! 1. El harness de test corre las funciones `#[tokio::test]` de este
-//!    mismo archivo en paralelo por default. Si los dos tests de acá
-//!    tienen un lease vencido al mismo tiempo, una sola llamada a
-//!    `reap_expired_leases` de cualquiera de los dos puede terminar
-//!    barriendo el job del otro también. Por eso las validaciones buscan
-//!    "mi job en algún lugar de la lista", no "la lista tiene exactamente
-//!    un elemento y es el mío".
-//! 2. Al reclamar, si el mismatch de `claimed.id != job.id` explota, hay
-//!    basura de otra corrida en la base (ver mismo comentario en
-//!    reliability.rs).
+//! 1. El harness de pruebas ejecuta las funciones `#[tokio::test]` de este
+//!    mismo archivo en paralelo por defecto. Si ambos tests de este
+//!    archivo tienen un lease vencido al mismo tiempo, una única llamada
+//!    a `reap_expired_leases` desde cualquiera de los dos puede recuperar
+//!    también el job del otro. Por esta razón, las validaciones verifican
+//!    que el job propio se encuentre en algún lugar del resultado, en
+//!    lugar de asumir que la lista contiene exactamente un elemento.
+//! 2. Si la aserción `claimed.id != job.id` falla al reclamar, existen
+//!    datos remanentes de otra corrida en la base (ver el comentario
+//!    equivalente en reliability.rs).
 
 use common::NewJob;
 
@@ -48,7 +49,7 @@ async fn expired_lease_gets_reaped_and_retried() {
         .await
         .unwrap();
 
-    // "worker-que-va-a-morir" reclama el job y nunca vuelve a aparecer.
+    // El worker "worker-que-va-a-morir" reclama el job y no vuelve a aparecer.
     let claimed = storage
         .claim_next_job("worker-que-va-a-morir")
         .await
@@ -60,27 +61,28 @@ async fn expired_lease_gets_reaped_and_retried() {
     assert!(claimed.lease_until.is_some(), "claim_next_job debería fijar un lease");
     assert_eq!(claimed.worker_id.as_deref(), Some("worker-que-va-a-morir"));
 
-    // Sin esto habría que esperar timeout_seconds + 30s reales. Pisamos el
-    // lease a mano para simular "ya venció" -- la trampa está acotada a
-    // una sola columna, no a la lógica que se está probando.
+    // Sin esta modificación, sería necesario esperar timeout_seconds más
+    // 30 segundos reales. Se adelanta el lease manualmente para simular su
+    // vencimiento; esta simplificación se limita a una sola columna y no
+    // afecta la lógica que se está verificando.
     sqlx::query("UPDATE jobs SET lease_until = now() - interval '1 second' WHERE id = $1")
         .bind(job.id)
         .execute(storage.pool())
         .await
         .unwrap();
 
-    // Otro worker, todavía vivo, corre el reaper y encuentra el cadáver.
-    // Puede haber barrido algo más si el otro test de este archivo corrió
-    // en simultáneo -- por eso buscamos nuestro job puntual en la lista en
-    // vez de asumir que fue lo único que se recuperó (ver comentario del
-    // módulo).
+    // Otro worker, todavía activo, ejecuta el reaper y encuentra el job
+    // abandonado. Es posible que también haya recuperado otro job si el
+    // segundo test de este archivo se ejecutó en simultáneo; por eso se
+    // busca el job propio dentro de la lista, en lugar de asumir que fue
+    // el único recuperado (ver comentario del módulo).
     let reaped = wait_until_reaped(&storage, job.id).await;
     assert_eq!(reaped, "retry_scheduled");
 
     let after = storage.get_job(job.id).await.unwrap().unwrap();
     assert_eq!(after.status, common::JobStatus::RetryScheduled);
     assert_eq!(after.attempts, 1);
-    // El job queda "libre" -- nadie lo posee hasta que alguien lo reclame de nuevo.
+    // El job queda sin dueño: nadie lo posee hasta que sea reclamado nuevamente.
     assert!(after.worker_id.is_none());
     assert!(after.lease_until.is_none());
     assert!(after.last_error.as_deref().unwrap().contains("lease expired"));
@@ -130,10 +132,10 @@ async fn expired_lease_past_max_attempts_goes_to_dead_letter() {
     assert_eq!(after.status, common::JobStatus::DeadLetter);
 }
 
-/// Dispara el reaper y espera a que nuestro job puntual salga de `running`
-/// (lo haya recuperado nuestra propia llamada o la del otro test de este
-/// archivo corriendo en simultáneo -- no importa quién, importa el
-/// resultado final de nuestro job). Devuelve el status final.
+/// Ejecuta el reaper y espera a que el job propio salga del estado
+/// `running`, sin importar si lo recuperó esta llamada o el otro test de
+/// este archivo ejecutándose en simultáneo; lo relevante es el resultado
+/// final del job en cuestión. Devuelve el estado final.
 async fn wait_until_reaped(storage: &common::Storage, job_id: uuid::Uuid) -> String {
     for _ in 0..10 {
         let _ = storage.reap_expired_leases().await.unwrap();

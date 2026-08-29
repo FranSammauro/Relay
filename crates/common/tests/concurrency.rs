@@ -1,21 +1,23 @@
-//! Test de concurrencia de Fase 2: 100 jobs, 10 "workers" compitiendo por
-//! ellos al mismo tiempo, contra un Postgres real. Esto no se puede simular
-//! con un mock -- lo que estamos probando es justamente que SKIP LOCKED se
-//! porta bien bajo contención real, así que necesita una base de verdad.
+//! Test de concurrencia de la Fase 2: 100 jobs y 10 workers simulados
+//! compitiendo por ellos simultáneamente, contra un PostgreSQL real. No es
+//! posible simular esto con un mock, ya que lo que se está verificando es
+//! precisamente el comportamiento de SKIP LOCKED bajo contención real, lo
+//! cual requiere una base de datos genuina.
 //!
-//! Si no hay Postgres disponible (por ejemplo corriendo `cargo test` en la
-//! máquina de alguien sin Docker levantado), el test se salta con un aviso
-//! en vez de romper toda la suite. En CI corre siempre contra el servicio
-//! de postgres de GitHub Actions (ver .github/workflows/ci.yml).
+//! Si no hay PostgreSQL disponible (por ejemplo, al ejecutar `cargo test`
+//! en una máquina sin Docker levantado), el test se omite con un aviso en
+//! lugar de interrumpir toda la suite. En CI se ejecuta siempre, contra el
+//! servicio de postgres de GitHub Actions (ver .github/workflows/ci.yml).
 //!
-//! Ojo con esto: `claim_next_job` reclama CUALQUIER job pendiente de la
-//! tabla, no solo los de este test -- es el comportamiento real y correcto
-//! para producción, así que no lo vamos a filtrar acá. Eso significa que si
-//! corrés esto contra una base con basura de otra corrida (otro test en
-//! paralelo, una prueba manual que dejaste a medio terminar), los workers
-//! de este test también van a agarrar esos jobs ajenos. Los completamos
-//! igual (para no dejarlos colgados en `running`), pero solo contamos y
-//! validamos los que llevan la marca de esta corrida.
+//! Es importante notar que `claim_next_job` reclama cualquier job
+//! pendiente de la tabla, no únicamente los creados por este test. Este es
+//! el comportamiento correcto para producción, por lo que no se filtra
+//! aquí. Esto implica que, si el test se ejecuta contra una base con datos
+//! remanentes de otra corrida (otro test en paralelo, o una prueba manual
+//! interrumpida), los workers de este test también reclamarán esos jobs
+//! ajenos. Dichos jobs se completan de todas formas, para no dejarlos
+//! pendientes en estado `running`, pero solo se cuentan y validan los que
+//! corresponden a esta corrida.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -33,8 +35,8 @@ async fn hundred_jobs_ten_workers_none_lost_none_duplicated() {
         return;
     };
 
-    // marca única por corrida para distinguir "mis jobs" de basura ajena
-    // que pueda andar dando vueltas en una base compartida/sucia.
+    // Marca única por corrida para distinguir los jobs propios de datos
+    // remanentes de otra ejecución en una base compartida o sin limpiar.
     let run_marker = format!("concurrency-test-{}", uuid::Uuid::new_v4());
 
     for i in 0..TOTAL_JOBS {
@@ -70,9 +72,10 @@ async fn hundred_jobs_ten_workers_none_lost_none_duplicated() {
                             .mark_completed(job.id)
                             .await
                             .expect("mark_completed no debería fallar");
-                        // jobs ajenos (basura de otra corrida) se completan
-                        // igual para no dejarlos colgados, pero no cuentan
-                        // para las validaciones de este test.
+                        // Los jobs ajenos (datos remanentes de otra
+                        // corrida) se completan de todas formas, para no
+                        // dejarlos pendientes, pero no se incluyen en las
+                        // validaciones de este test.
                         if belongs_to_this_run {
                             claimed.push(job.id);
                         }
@@ -87,11 +90,12 @@ async fn hundred_jobs_ten_workers_none_lost_none_duplicated() {
 
     let mut all_claimed = Vec::new();
     for h in handles {
-        all_claimed.extend(h.await.expect("la tarea del worker no debería paniquear"));
+        all_claimed.extend(h.await.expect("la tarea del worker no debería entrar en pánico"));
     }
 
-    // ningún job se claimeó dos veces -- si esto falla, SKIP LOCKED dejó
-    // de hacer lo que promete y hay que revisar la query de claim.
+    // Ningún job debería haberse reclamado dos veces. Si esta aserción
+    // falla, SKIP LOCKED dejó de cumplir su garantía y corresponde revisar
+    // la consulta de claim.
     let unique: HashSet<_> = all_claimed.iter().collect();
     assert_eq!(
         unique.len(),
@@ -99,7 +103,7 @@ async fn hundred_jobs_ten_workers_none_lost_none_duplicated() {
         "se detectaron jobs reclamados más de una vez"
     );
 
-    // y ninguno se perdió
+    // Tampoco debería haberse perdido ninguno.
     assert_eq!(
         all_claimed.len(),
         TOTAL_JOBS,
@@ -120,6 +124,6 @@ async fn hundred_jobs_ten_workers_none_lost_none_duplicated() {
 
     assert_eq!(
         completed_from_this_run, TOTAL_JOBS,
-        "no todos los jobs de esta corrida terminaron completed"
+        "no todos los jobs de esta corrida terminaron en estado completed"
     );
 }

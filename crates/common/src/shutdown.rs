@@ -1,11 +1,12 @@
-//! Fase 6: graceful shutdown. Vive en `common` porque tanto `api` como
-//! `worker` necesitan exactamente lo mismo -- esperar a SIGTERM (el que
-//! manda Docker/Kubernetes al bajar un contenedor) o Ctrl+C (para
-//! desarrollo local), sin duplicar el `select!` en cada binario.
+//! Fase 6: manejo de cierre ordenado (graceful shutdown). Se ubica en
+//! `common` porque tanto `api` como `worker` requieren exactamente el
+//! mismo comportamiento: esperar a SIGTERM, la señal que Docker o
+//! Kubernetes envían al detener un contenedor, o a Ctrl+C durante el
+//! desarrollo local, sin duplicar la lógica de `select!` en cada binario.
 
-/// Se resuelve cuando llega SIGTERM o Ctrl+C. Pensado para usarse tal cual
-/// con `axum::serve(...).with_graceful_shutdown(...)`, o adentro de un
-/// `tokio::select!` en cualquier otro loop de fondo.
+/// Se resuelve cuando llega SIGTERM o Ctrl+C. Pensado para utilizarse
+/// directamente con `axum::serve(...).with_graceful_shutdown(...)`, o
+/// dentro de un `tokio::select!` en cualquier otro ciclo de fondo.
 pub async fn signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()

@@ -9,7 +9,7 @@ pub use error::QueueError;
 pub use cron::{CronError, CronExpr};
 pub use heartbeats::Heartbeats;
 pub use model::{
-    AttemptOutcome, CronSchedule, Job, JobAttempt, JobDurationStats, JobStatus, NewCronSchedule,
-    NewJob, StatusCount, WorkerInfo,
+    AttemptOutcome, BenchTimestamps, CronSchedule, Job, JobAttempt, JobDurationStats, JobStatus,
+    NewCronSchedule, NewJob, StatusCount, WorkerInfo,
 };
 pub use storage::Storage;

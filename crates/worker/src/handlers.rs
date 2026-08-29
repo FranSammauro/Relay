@@ -15,9 +15,10 @@ pub async fn execute(job_type: &str, payload: &Value) -> Result<(), String> {
     }
 }
 
-/// Handler de utilidad para demos y smoke tests -- duerme la cantidad de
-/// segundos que le pidas en el payload. Sirve para probar timeouts y
-/// recovery de leases sin tener que inventar un caso de negocio real.
+/// Handler de utilidad para demostraciones y pruebas de humo: permanece
+/// inactivo durante la cantidad de segundos indicada en el payload. Se
+/// utiliza para probar timeouts y recuperación de leases sin necesidad de
+/// definir un caso de negocio real.
 async fn sleep_job(payload: &Value) -> Result<(), String> {
     let seconds = payload.get("seconds").and_then(|v| v.as_u64()).unwrap_or(1);
     tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;

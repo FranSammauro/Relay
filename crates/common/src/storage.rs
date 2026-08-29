@@ -5,35 +5,36 @@ use uuid::Uuid;
 
 use crate::error::QueueError;
 use crate::model::{
-    AttemptOutcome, CronSchedule, Job, JobAttempt, JobDurationStats, JobRow, NewCronSchedule,
-    NewJob, StatusCount, WorkerInfo,
+    AttemptOutcome, BenchTimestamps, CronSchedule, Job, JobAttempt, JobDurationStats, JobRow,
+    NewCronSchedule, NewJob, StatusCount, WorkerInfo,
 };
 
-/// Columnas de `jobs` compartidas por casi todas las queries de este módulo.
-/// Un solo lugar para tocar si el día de mañana se agrega una columna --
-/// ya nos pasó de olvidarnos una en un SELECT y perder una tarde con eso.
+/// Columnas de `jobs` compartidas por casi todas las consultas de este
+/// módulo. Centralizarlas en una sola constante evita el riesgo de omitir
+/// una columna en algún SELECT al agregar campos nuevos.
 const JOB_COLUMNS: &str = r#"id, job_type, payload, status, priority, attempts, max_attempts,
                       scheduled_at, created_at, started_at, completed_at, failed_at,
                       worker_id, lease_until, timeout_seconds, idempotency_key, last_error"#;
 
-/// Cuánto margen le damos al lease de un job por encima de su propio
-/// `timeout_seconds`. El timeout ya mata el job in-process si se cuelga;
-/// el lease existe para el caso más feo, que el proceso entero del worker
-/// desaparezca (kill -9, OOM, nodo caído) antes de que el timeout llegue a
-/// dispararse. 30s de margen cubre jitter de scheduling y GC pauses sin
-/// hacer que un job legítimamente lento parezca abandonado.
+/// Margen adicional que se otorga al lease de un job por encima de su
+/// propio `timeout_seconds`. El timeout ya finaliza el job dentro del
+/// proceso si este se cuelga; el lease cubre el caso en que el proceso
+/// completo del worker desaparece (kill -9, OOM, caída del nodo) antes de
+/// que el timeout llegue a activarse. Un margen de 30 segundos absorbe
+/// variaciones normales de scheduling y pausas de recolección de basura
+/// sin que un job legítimamente lento se interprete como abandonado.
 ///
-/// Nota de scope: el lease se fija una sola vez al hacer claim, no se
-/// renueva mientras el job corre. Para jobs individuales esto está bien
-/// porque timeout_seconds + este margen ya define un techo razonable. Un
-/// lease renovable (heartbeat por-job en vez de por-worker) es la
-/// evolución natural si algún día hay jobs de duración muy variable, pero
-/// es la típica funcionalidad que se anota en el roadmap en vez de meterla
-/// a presión en el MVP.
+/// Nota de alcance: el lease se fija una única vez al momento del claim y
+/// no se renueva mientras el job se ejecuta. Para jobs individuales esto
+/// es suficiente, dado que timeout_seconds más este margen ya definen un
+/// límite razonable. Un lease renovable, con heartbeat por job en lugar
+/// de por worker, sería la evolución natural si en el futuro existieran
+/// jobs de duración muy variable; por ahora queda fuera del alcance
+/// definido para el MVP.
 const LEASE_GRACE_SECONDS: i32 = 30;
 
-/// Storage es la única puerta de entrada a PostgreSQL, que actúa como fuente
-/// de verdad para el estado persistente del sistema (ADR-001).
+/// Storage es el único punto de acceso a PostgreSQL, que actúa como
+/// fuente de verdad para el estado persistente del sistema (ADR-001).
 #[derive(Clone)]
 pub struct Storage {
     pool: PgPool,
@@ -60,9 +61,9 @@ impl Storage {
         &self.pool
     }
 
-    /// Inserta un job nuevo. Si trae idempotency_key y ya existe un job con esa
-    /// clave, devuelve el job existente en lugar de crear uno duplicado
-    /// (ver sección "Idempotency Keys" del informe).
+    /// Inserta un job nuevo. Si se especifica idempotency_key y ya existe
+    /// un job con esa clave, devuelve el job existente en lugar de crear
+    /// uno duplicado (ver sección "Idempotency Keys" del informe técnico).
     pub async fn create_job(&self, new_job: NewJob) -> Result<Job, QueueError> {
         if let Some(key) = &new_job.idempotency_key {
             if let Some(existing) = self.get_job_by_idempotency_key(key).await? {
@@ -138,11 +139,12 @@ impl Storage {
 
     /// Reclama el siguiente job disponible para un worker.
     ///
-    /// Usa `FOR UPDATE SKIP LOCKED` para que múltiples workers puedan hacer
-    /// polling concurrente sin bloquearse entre sí ni reclamar el mismo job
-    /// dos veces (ver ADR-005). Desde Fase 3 también recoge los jobs en
-    /// `retry_scheduled` cuyo backoff ya venció -- para el claim, un retry
-    /// listo para correr es indistinguible de un job nuevo.
+    /// Utiliza `FOR UPDATE SKIP LOCKED` para que múltiples workers puedan
+    /// realizar polling concurrente sin bloquearse entre sí ni reclamar el
+    /// mismo job dos veces (ver ADR-005). Desde la Fase 3 también incluye
+    /// los jobs en `retry_scheduled` cuyo backoff ya venció: a efectos del
+    /// claim, un reintento listo para ejecutarse es equivalente a un job
+    /// nuevo.
     pub async fn claim_next_job(&self, worker_id: &str) -> Result<Option<Job>, QueueError> {
         let mut tx = self.pool.begin().await?;
 
@@ -182,9 +184,10 @@ impl Storage {
         .fetch_one(&mut *tx)
         .await?;
 
-        // Abrimos el registro de este intento. Se cierra en record_success /
-        // record_failure buscando la fila con finished_at IS NULL -- no hace
-        // falta ir pasando el id del attempt de un lado a otro.
+        // Se abre el registro del intento. Se cierra posteriormente en
+        // mark_completed o transition_after_failure, localizando la fila
+        // con finished_at IS NULL; no es necesario propagar el id del
+        // attempt entre funciones.
         sqlx::query(
             r#"
             INSERT INTO job_attempts (job_id, attempt_number, worker_id, started_at)
@@ -225,23 +228,26 @@ impl Storage {
         Ok(())
     }
 
-    /// Núcleo compartido de "este intento falló, ¿y ahora?". Lo usan tanto
-    /// `record_failure` (el worker reporta un fallo mientras sigue vivo)
-    /// como `reap_expired_leases` (nadie reporta nada porque el worker ya
-    /// no está, así que lo inferimos del lease vencido). Misma decisión de
-    /// retry-vs-dead_letter en los dos casos -- un job no debería tener dos
-    /// políticas de reintento distintas según quién detectó el fallo.
+    /// Núcleo compartido de la transición "este intento falló, cuál es el
+    /// siguiente paso". Lo utilizan tanto `record_failure` (el worker
+    /// reporta un fallo mientras sigue activo) como `reap_expired_leases`
+    /// (no hay reporte porque el worker ya no está disponible, y el fallo
+    /// se infiere del lease vencido). Ambos casos aplican la misma
+    /// decisión entre reintento y dead_letter: un job no debería tener
+    /// políticas de reintento distintas según qué mecanismo detectó el
+    /// fallo.
     ///
-    /// El cálculo de backoff vive en SQL a propósito: así la decisión
-    /// "cuántos intentos van" y "cuándo es el próximo" quedan atómicas
-    /// dentro de un solo UPDATE, sin ida y vuelta con Rust en el medio que
-    /// pueda pisarse con otro proceso tocando el mismo job.
+    /// El cálculo de backoff se realiza en SQL de forma deliberada: así la
+    /// decisión de cuántos intentos restan y cuándo corresponde el
+    /// próximo quedan dentro de una única transacción UPDATE, sin una
+    /// ida y vuelta intermedia hacia Rust que pueda quedar desincronizada
+    /// si otro proceso modifica el mismo job.
     ///
     /// Fórmula: delay = min(2s * 2^(attempts-1), 300s) + random(0..2s).
-    /// Cap de 5 minutos y jitter de hasta 2s para no generar manada de
-    /// reintentos pegados todos al mismo segundo (thundering herd de
-    /// bolsillo). Es un valor fijo por ahora -- si hace falta hacerlo
-    /// configurable por job, es la próxima vuelta de tuerca, no un MVP.
+    /// El límite superior de 5 minutos y el jitter de hasta 2 segundos
+    /// evitan que múltiples reintentos queden agrupados en el mismo
+    /// instante. El valor es fijo por el momento; hacerlo configurable por
+    /// job queda fuera del alcance definido para el MVP.
     async fn transition_after_failure(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         id: Uuid,
@@ -285,9 +291,9 @@ impl Storage {
         Ok(row.0)
     }
 
-    /// Registra un intento fallido reportado por un worker vivo. Devuelve
-    /// el estado resultante (`retry_scheduled` o `dead_letter`) para que el
-    /// caller pueda loguear bien lo que pasó.
+    /// Registra un intento fallido reportado por un worker activo.
+    /// Devuelve el estado resultante (`retry_scheduled` o `dead_letter`)
+    /// para que quien llame pueda registrar correctamente el resultado.
     pub async fn record_failure(
         &self,
         id: Uuid,
@@ -300,17 +306,18 @@ impl Storage {
         Ok(status)
     }
 
-    /// El reaper: busca jobs cuyo lease venció sin que nadie los haya
-    /// marcado como terminados, y los recupera aplicando la misma lógica
-    /// de retry/DLQ que un fallo reportado normalmente.
+    /// El reaper: localiza jobs cuyo lease venció sin que nadie los haya
+    /// marcado como finalizados y los recupera aplicando la misma lógica
+    /// de reintento o dead-letter que un fallo reportado normalmente.
     ///
-    /// `FOR UPDATE SKIP LOCKED` dentro de la misma transacción que hace la
-    /// transición (no dos transacciones separadas) es lo que hace esto
-    /// seguro con múltiples workers corriendo el reaper al mismo tiempo
-    /// (ver ADR-004): si dos reapers compiten por el mismo job abandonado,
-    /// uno se queda con la fila bloqueada hasta terminar de transicionarla,
-    /// el otro simplemente no la ve y sigue de largo. Ninguno de los dos
-    /// pisa al otro ni duplica el trabajo de recovery.
+    /// El uso de `FOR UPDATE SKIP LOCKED` dentro de la misma transacción
+    /// que realiza la transición, en lugar de dos transacciones separadas,
+    /// es lo que garantiza la seguridad cuando múltiples workers ejecutan
+    /// el reaper simultáneamente (ver ADR-004): si dos instancias del
+    /// reaper compiten por el mismo job abandonado, una retiene la fila
+    /// bloqueada hasta completar la transición mientras la otra
+    /// simplemente la omite y continúa. Ninguna de las dos interfiere con
+    /// la otra ni se duplica el trabajo de recuperación.
     pub async fn reap_expired_leases(&self) -> Result<Vec<(Uuid, String)>, QueueError> {
         let mut tx = self.pool.begin().await?;
 
@@ -340,7 +347,7 @@ impl Storage {
         Ok(results)
     }
 
-    /// Historial completo de intentos de un job, más reciente primero.
+    /// Historial completo de intentos de un job, ordenado del más reciente al más antiguo.
     pub async fn list_attempts(&self, job_id: Uuid) -> Result<Vec<JobAttempt>, QueueError> {
         let rows = sqlx::query_as::<_, JobAttempt>(
             r#"
@@ -366,14 +373,14 @@ impl Storage {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Registra un worker al arrancar. Es upsert porque si reiniciás un
-    /// worker con el mismo WORKER_ID (por ejemplo en un redeploy), no tiene
-    /// sentido explotar por unique constraint -- simplemente actualiza
-    /// concurrency y started_at.
+    /// Registra un worker al iniciar. Es una operación upsert: si un
+    /// worker se reinicia con el mismo WORKER_ID, por ejemplo tras un
+    /// redeploy, no corresponde fallar por la restricción de unicidad,
+    /// sino actualizar concurrency y started_at.
     ///
-    /// Esto NO es el mecanismo de liveness (eso es Fase 4 con heartbeats de
-    /// verdad). Si el worker se cae de mala manera, la fila queda como
-    /// "último dato conocido" nomás.
+    /// Esto no constituye el mecanismo de liveness (ese corresponde a la
+    /// Fase 4, con heartbeats reales). Si el worker finaliza de forma
+    /// anómala, la fila permanece como el último dato conocido.
     pub async fn register_worker(&self, worker_id: &str, concurrency: i32) -> Result<(), QueueError> {
         sqlx::query(
             r#"
@@ -391,9 +398,9 @@ impl Storage {
         Ok(())
     }
 
-    /// Cuenta jobs agrupados por estado. Sirve para el `queue_depth`
-    /// observable que pide la Fase 2 y como base cruda para las métricas
-    /// Prometheus que llegan en Fase 6.
+    /// Cuenta jobs agrupados por estado. Utilizado por el `queue_depth`
+    /// observable de la Fase 2 y como base para las métricas Prometheus de
+    /// la Fase 6.
     pub async fn count_by_status(&self) -> Result<Vec<StatusCount>, QueueError> {
         let rows = sqlx::query_as::<_, StatusCount>(
             r#"SELECT status, COUNT(*) as count FROM jobs GROUP BY status"#,
@@ -403,11 +410,12 @@ impl Storage {
         Ok(rows)
     }
 
-    /// Conteo de intentos por resultado (`completed`/`failed`/`timeout`/
-    /// `lease_expired`). A diferencia de `count_by_status` (estado actual
-    /// de cada job), esto es un contador que solo crece -- sirve como
-    /// `_total` de Prometheus en `GET /metrics` sin necesitar acumular
-    /// nada en memoria del proceso (ver comentario en `handlers::metrics`).
+    /// Conteo de intentos por resultado (`completed`, `failed`, `timeout`,
+    /// `lease_expired`). A diferencia de `count_by_status`, que refleja el
+    /// estado actual de cada job, este valor es un contador monótono
+    /// creciente. Cumple el rol de métrica `_total` de Prometheus en
+    /// `GET /metrics` sin necesidad de acumular estado en memoria del
+    /// proceso (ver comentario en `handlers::metrics`).
     pub async fn count_attempts_by_outcome(&self) -> Result<Vec<StatusCount>, QueueError> {
         let rows = sqlx::query_as::<_, StatusCount>(
             r#"
@@ -422,10 +430,10 @@ impl Storage {
         Ok(rows)
     }
 
-    /// Percentiles de duración de attempts terminados, agrupados por tipo
+    /// Percentiles de duración de attempts finalizados, agrupados por tipo
     /// de job. `percentile_cont` es una función de agregación estándar de
-    /// Postgres -- no hace falta mantener un histograma en memoria en
-    /// ningún proceso, la propia base lo calcula al vuelo.
+    /// PostgreSQL: no es necesario mantener un histograma en memoria de
+    /// ningún proceso, ya que la propia base de datos realiza el cálculo.
     pub async fn job_duration_percentiles(&self) -> Result<Vec<JobDurationStats>, QueueError> {
         let rows = sqlx::query_as::<_, JobDurationStats>(
             r#"
@@ -445,9 +453,30 @@ impl Storage {
         Ok(rows)
     }
 
-    /// Todos los workers que alguna vez se registraron (no solo los vivos
-    /// ahora mismo -- para eso está `Heartbeats::list_alive`, que consulta
-    /// Redis). La API combina las dos fuentes en `GET /workers`.
+    /// Timestamps crudos de un lote de jobs identificados por un prefijo
+    /// de idempotency_key, para el benchmark de la Fase 7. Se devuelven
+    /// los valores sin agregar (a diferencia de job_duration_percentiles)
+    /// porque el benchmark necesita calcular percentiles combinando estos
+    /// datos con las mediciones de latencia de envío tomadas del lado del
+    /// cliente, no solo la duración de ejecución.
+    pub async fn bench_timestamps(&self, idempotency_prefix: &str) -> Result<Vec<BenchTimestamps>, QueueError> {
+        let rows = sqlx::query_as::<_, BenchTimestamps>(
+            r#"
+            SELECT id, status, created_at, started_at, completed_at, failed_at
+            FROM jobs
+            WHERE idempotency_key LIKE $1
+            "#,
+        )
+        .bind(format!("{idempotency_prefix}%"))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Todos los workers que se registraron en algún momento, no
+    /// únicamente los que están activos ahora mismo (para eso está
+    /// `Heartbeats::list_alive`, que consulta Redis). La API combina
+    /// ambas fuentes en `GET /workers`.
     pub async fn list_workers(&self) -> Result<Vec<WorkerInfo>, QueueError> {
         let rows = sqlx::query_as::<_, WorkerInfo>(
             r#"SELECT id, concurrency, started_at FROM workers ORDER BY started_at DESC"#,
@@ -457,18 +486,19 @@ impl Storage {
         Ok(rows)
     }
 
-    // ---- Fase 5: scheduling ----------------------------------------
+    // Fase 5: scheduling.
 
     /// Crea un cron schedule nuevo. Valida la expresión y calcula el
-    /// primer `next_run_at` acá mismo -- quien llama no elige esa fecha,
-    /// para que no haya forma de crear un schedule con un `next_run_at`
-    /// inconsistente con su propia expresión.
+    /// primer `next_run_at` en esta misma función; quien invoca el método
+    /// no elige esa fecha directamente, de modo que no es posible crear un
+    /// schedule con un `next_run_at` inconsistente con su propia
+    /// expresión.
     pub async fn create_cron_schedule(&self, new: NewCronSchedule) -> Result<CronSchedule, QueueError> {
         let expr = crate::cron::CronExpr::parse(&new.cron_expr)
             .map_err(|e| QueueError::InvalidPayload(e.to_string()))?;
         let next_run_at = expr
             .next_after(Utc::now())
-            .ok_or_else(|| QueueError::InvalidPayload("la expresión cron nunca matchea ninguna fecha".into()))?;
+            .ok_or_else(|| QueueError::InvalidPayload("la expresión cron no coincide con ninguna fecha".into()))?;
 
         let row = sqlx::query_as::<_, CronSchedule>(
             r#"
@@ -528,10 +558,11 @@ impl Storage {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Cron schedules habilitados cuyo `next_run_at` ya pasó. Solo el líder
-    /// del scheduler (ver `Storage::try_become_scheduler_leader`) debería
-    /// llamar a esto -- no tiene `SKIP LOCKED` porque no está pensado para
-    /// que varios procesos lo llamen a la vez, a propósito (ver ADR-006).
+    /// Cron schedules habilitados cuyo `next_run_at` ya venció. Solo el
+    /// líder del scheduler (ver `Storage::try_become_scheduler_leader`)
+    /// debe invocar este método; deliberadamente no utiliza
+    /// `SKIP LOCKED`, ya que no está pensado para ser llamado por
+    /// múltiples procesos de forma concurrente (ver ADR-006).
     pub async fn due_cron_schedules(&self) -> Result<Vec<CronSchedule>, QueueError> {
         let rows = sqlx::query_as::<_, CronSchedule>(
             r#"
@@ -548,22 +579,23 @@ impl Storage {
     }
 
     /// Dispara un cron schedule: crea el job real a partir de la plantilla
-    /// y avanza `next_run_at` al siguiente horario. Las dos cosas van en la
-    /// misma transacción -- si algo falla a mitad de camino, mejor que el
-    /// schedule quede exactamente como estaba (y se reintente en el
-    /// próximo ciclo del scheduler) a que quede "a medio disparar".
+    /// y avanza `next_run_at` al siguiente horario. Ambas operaciones se
+    /// realizan en la misma transacción; si algo falla a mitad de camino,
+    /// es preferible que el schedule permanezca exactamente como estaba,
+    /// para ser reintentado en el próximo ciclo del scheduler, a que quede
+    /// en un estado intermedio.
     ///
-    /// El job creado lleva un `idempotency_key` derivado del id del
-    /// schedule y del `next_run_at` que se estaba cumpliendo. Es una
-    /// segunda red de seguridad además de la exclusión mutua del líder: si
-    /// por lo que fuera este disparo se ejecuta dos veces para el mismo
-    /// horario, `create_job` ya sabe devolver el job existente en vez de
-    /// duplicar (Fase 1).
+    /// El job creado incluye un `idempotency_key` derivado del id del
+    /// schedule y del `next_run_at` que se estaba cumpliendo. Esto
+    /// constituye una segunda capa de seguridad además de la exclusión
+    /// mutua del líder: si por alguna razón este disparo se ejecutara dos
+    /// veces para el mismo horario, `create_job` devuelve el job existente
+    /// en lugar de crear un duplicado (ver Fase 1).
     pub async fn fire_cron_schedule(&self, schedule: &CronSchedule) -> Result<Job, QueueError> {
         let expr = crate::cron::CronExpr::parse(&schedule.cron_expr)
             .map_err(|e| QueueError::InvalidPayload(e.to_string()))?;
         let next_run_at = expr.next_after(schedule.next_run_at).ok_or_else(|| {
-            QueueError::InvalidPayload("la expresión cron dejó de tener próximas ocurrencias".into())
+            QueueError::InvalidPayload("la expresión cron ya no tiene próximas ocurrencias".into())
         })?;
 
         let idempotency_key = format!("cron:{}:{}", schedule.id, schedule.next_run_at.to_rfc3339());
@@ -597,14 +629,14 @@ impl Storage {
         Ok(job_row.into())
     }
 
-    /// Intenta convertirse en el líder del scheduler de cron usando un
-    /// advisory lock de sesión de Postgres (ver ADR-006). Si lo consigue,
-    /// devuelve una conexión dedicada que hay que mantener viva mientras
-    /// dure el liderazgo -- soltarla (drop) libera el lock automáticamente,
-    /// tanto si se hace a propósito como si el proceso muere.
+    /// Intenta convertirse en líder del scheduler de cron mediante un
+    /// advisory lock de sesión de PostgreSQL (ver ADR-006). Si lo obtiene,
+    /// devuelve una conexión dedicada que debe mantenerse activa mientras
+    /// dure el liderazgo. Liberar esa conexión, ya sea de forma explícita
+    /// o porque el proceso finaliza, libera automáticamente el lock.
     ///
     /// `pg_try_advisory_lock` es no bloqueante: si otro proceso ya es
-    /// líder, devuelve `Ok(None)` al toque en vez de esperar.
+    /// líder, devuelve `Ok(None)` de inmediato en lugar de esperar.
     pub async fn try_become_scheduler_leader(
         &self,
     ) -> Result<Option<sqlx::pool::PoolConnection<sqlx::Postgres>>, QueueError> {
@@ -622,9 +654,9 @@ impl Storage {
     }
 }
 
-/// Key arbitraria pero fija para el advisory lock del líder del scheduler
-/// de cron. No tiene que ver con ningún dato real -- es solo un nombre de
-/// lock con forma de número, elegido para que no choque por casualidad con
-/// otro lock que alguien agregue después (advisory locks comparten un
-/// único namespace de enteros por base).
-const SCHEDULER_LEADER_LOCK_KEY: i64 = 0x63726f6e_6c6561; // "cronlea" en hex, mnemónico nomás
+/// Clave arbitraria pero fija para el advisory lock del líder del
+/// scheduler de cron. No corresponde a ningún dato real; es únicamente un
+/// identificador numérico elegido para evitar colisiones con otro lock
+/// que se agregue en el futuro (los advisory locks comparten un único
+/// espacio de enteros por base de datos).
+const SCHEDULER_LEADER_LOCK_KEY: i64 = 0x63726f6e_6c6561; // Representación hexadecimal de "cronlea", como valor mnemónico.

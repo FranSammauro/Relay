@@ -1,19 +1,22 @@
-//! Test de reliability (Fase 3): un job con max_attempts=3 que siempre
-//! falla tiene que pasar por dos rondas de retry_scheduled y terminar en
-//! dead_letter en el tercer intento -- ni antes, ni después. También
-//! valida que job_attempts queda con la película completa.
+//! Test de reliability (Fase 3): un job con max_attempts=3 que falla
+//! sistemáticamente debe atravesar dos rondas de retry_scheduled y recién
+//! entonces terminar en dead_letter en el tercer intento, ni antes ni
+//! después. También verifica que job_attempts conserve el registro
+//! completo de la secuencia.
 //!
-//! Como en concurrency.rs, esto necesita Postgres real: la lógica de
-//! backoff vive en SQL (CASE + random() dentro del UPDATE), así que no
-//! hay forma honesta de mockearla.
+//! Al igual que concurrency.rs, este test requiere PostgreSQL real: la
+//! lógica de backoff reside en SQL (CASE combinado con random() dentro del
+//! UPDATE), por lo que no existe una forma representativa de simularla
+//! con un mock.
 //!
-//! A diferencia de concurrency.rs, este test SÍ asume que es dueño
-//! exclusivo de lo que hay para reclamar en el momento de cada claim (por
-//! eso valida `claimed.id == job.id` en vez de tolerar jobs ajenos). Si
-//! esto falla con un mismatch de id, lo más probable es que haya un job
-//! `pending`/`retry_scheduled` viejo dando vueltas en la base de otra
-//! corrida interrumpida -- limpiá la base (`docker compose down -v` y
-//! volvé a levantar postgres) antes de reintentar.
+//! A diferencia de concurrency.rs, este test sí asume ser el único
+//! consumidor de lo disponible para reclamar en cada claim, razón por la
+//! cual valida `claimed.id == job.id` en lugar de tolerar jobs ajenos. Si
+//! esta aserción falla por una discrepancia de id, lo más probable es que
+//! exista un job `pending` o `retry_scheduled` remanente de una corrida
+//! anterior interrumpida; en ese caso, conviene limpiar la base
+//! (`docker compose down -v` y volver a levantar postgres) antes de
+//! reintentar.
 
 use common::{AttemptOutcome, NewJob};
 
@@ -40,8 +43,9 @@ async fn failing_job_retries_then_dead_letters() {
         .await
         .expect("create_job no debería fallar");
 
-    // Intentos 1 y 2: todavía quedan reintentos, así que va a
-    // retry_scheduled con un scheduled_at en el futuro (backoff).
+    // Intentos 1 y 2: todavía quedan reintentos disponibles, por lo que el
+    // job pasa a retry_scheduled con un scheduled_at en el futuro, según
+    // el backoff calculado.
     for attempt in 1..=2 {
         let claimed = storage
             .claim_next_job(worker_id)
@@ -50,7 +54,7 @@ async fn failing_job_retries_then_dead_letters() {
             .unwrap_or_else(|| panic!("debería poder reclamar el job en el intento {attempt}"));
         assert_eq!(
             claimed.id, job.id,
-            "se reclamó un job distinto al de este test -- ¿hay basura vieja en la base?"
+            "se reclamó un job distinto al de este test; verificar si hay datos remanentes en la base"
         );
         assert_eq!(claimed.attempts, attempt);
 
@@ -67,22 +71,22 @@ async fn failing_job_retries_then_dead_letters() {
             .expect("el job debería seguir existiendo");
         assert!(
             after.scheduled_at > chrono::Utc::now(),
-            "el backoff debería agendar el retry en el futuro, no ahora"
+            "el backoff debería agendar el retry en el futuro, no en el presente"
         );
 
-        // Sin esto el test tendría que dormir minutos reales esperando el
-        // backoff. Pisamos scheduled_at a mano para simular "ya pasó el
-        // tiempo de espera" -- es la única parte donde el test hace trampa
-        // a propósito, y está bien: lo que se prueba es la transición de
-        // estados, no el reloj.
+        // Sin este ajuste, el test tendría que esperar minutos reales
+        // hasta que venza el backoff. Se adelanta scheduled_at
+        // manualmente para simular que el tiempo de espera ya transcurrió;
+        // esta es la única concesión deliberada del test, ya que lo que se
+        // verifica es la transición de estados, no el paso del tiempo.
         sqlx::query("UPDATE jobs SET scheduled_at = now() - interval '1 second' WHERE id = $1")
             .bind(job.id)
             .execute(storage.pool())
             .await
-            .expect("no debería fallar el fast-forward del backoff");
+            .expect("no debería fallar el adelanto manual del backoff");
     }
 
-    // Intento 3: attempts llega a max_attempts, así que esta vez es DLQ.
+    // Intento 3: attempts alcanza max_attempts, por lo que corresponde dead-letter.
     let claimed = storage
         .claim_next_job(worker_id)
         .await
@@ -105,7 +109,7 @@ async fn failing_job_retries_then_dead_letters() {
     assert_eq!(final_job.status, common::JobStatus::DeadLetter);
     assert!(final_job.failed_at.is_some());
 
-    // Un job en dead_letter es terminal: nadie más lo puede reclamar.
+    // Un job en dead_letter es terminal: no debería poder ser reclamado nuevamente.
     let nothing_to_claim = storage
         .claim_next_job(worker_id)
         .await
@@ -115,8 +119,8 @@ async fn failing_job_retries_then_dead_letters() {
         "un job en dead_letter no debería ser reclamable"
     );
 
-    // job_attempts tiene que tener los 3 intentos, con el error y el
-    // outcome correctos en cada uno.
+    // job_attempts debe registrar los 3 intentos, con el error y el
+    // resultado correctos en cada uno.
     let attempts = storage
         .list_attempts(job.id)
         .await
