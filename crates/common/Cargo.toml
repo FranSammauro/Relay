@@ -18,3 +18,4 @@ urlencoding.workspace = true
 redis.workspace = true
 rand.workspace = true
 futures-util = "0.3"
+sha2 = "0.10"

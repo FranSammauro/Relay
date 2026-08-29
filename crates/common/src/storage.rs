@@ -3,6 +3,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::api_keys::{ApiKeyRecord, ApiKeyRole, ApiKeySecret, StoredApiKey};
 use crate::error::QueueError;
 use crate::model::{
     AttemptOutcome, BenchTimestamps, CronSchedule, Job, JobAttempt, JobDurationStats, JobRow,
@@ -651,6 +652,103 @@ impl Storage {
         } else {
             Ok(None)
         }
+    }
+
+    // Fase 8: API keys (ver ADR-007).
+
+    /// Crea una key nueva y la devuelve con su secreto en texto plano.
+    /// Este es el ÚNICO momento en que la key completa existe en el
+    /// sistema: se imprime al caller y no queda en ningún lugar (en la
+    /// base solo viven `key_prefix` y el hash).
+    pub async fn create_api_key(&self, name: &str, role: ApiKeyRole) -> Result<(ApiKeyRecord, ApiKeySecret), QueueError> {
+        let secret = crate::api_keys::generate();
+
+        let row: (Uuid, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+            r#"
+            INSERT INTO api_keys (name, key_prefix, key_hash, role)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id, created_at
+            "#,
+        )
+        .bind(name)
+        .bind(secret.prefix())
+        .bind(secret.hash())
+        .bind(role.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+
+        let record = ApiKeyRecord {
+            id: row.0,
+            name: name.to_string(),
+            key_prefix: secret.prefix().to_string(),
+            role,
+            created_at: row.1,
+            revoked_at: None,
+            last_used_at: None,
+        };
+
+        Ok((record, secret))
+    }
+
+    /// Lista todas las keys (activas y revocadas) para auditoría/provisión
+    /// de admin. Nunca incluye el hash ni el secreto; solo `key_prefix`.
+    pub async fn list_api_keys(&self) -> Result<Vec<ApiKeyRecord>, QueueError> {
+        let rows = sqlx::query_as::<_, ApiKeyRecord>(
+            r#"
+            SELECT id, name, key_prefix, role, created_at, revoked_at, last_used_at
+            FROM api_keys
+            ORDER BY created_at DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Busca una key por prefijo para el camino de verificación de la API.
+    /// Expone el hash internamente: no debe serializarse ni salir del proceso.
+    pub async fn find_api_key_by_prefix(&self, prefix: &str) -> Result<Option<StoredApiKey>, QueueError> {
+        let row = sqlx::query_as::<_, StoredApiKey>(
+            r#"
+            SELECT id, key_prefix, key_hash, role, revoked_at
+            FROM api_keys
+            WHERE key_prefix = $1
+            "#,
+        )
+        .bind(prefix)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Revoca una key por prefijo. Devuelve `false` si no existía o ya
+    /// estaba revocada.
+    pub async fn revoke_api_key_by_prefix(&self, prefix: &str) -> Result<bool, QueueError> {
+        let result = sqlx::query(
+            r#"UPDATE api_keys SET revoked_at = now() WHERE key_prefix = $1 AND revoked_at IS NULL"#,
+        )
+        .bind(prefix)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Registra `last_used_at` de forma "mejor esfuerzo": el WHERE con la
+    /// ventana de un minuto hace que, al 1 rps promedio, se escriba como
+    /// máximo una vez por minuto por key, y el caller (el middleware de
+    /// auth) puede lanzarlo con `tokio::spawn` sin esperar el resultado.
+    pub async fn touch_api_key(&self, id: Uuid) -> Result<(), QueueError> {
+        sqlx::query(
+            r#"
+            UPDATE api_keys
+            SET last_used_at = now()
+            WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')
+            "#,
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }
 

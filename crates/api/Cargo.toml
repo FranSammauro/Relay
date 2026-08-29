@@ -17,3 +17,8 @@ dotenvy.workspace = true
 anyhow.workspace = true
 axum = "0.7"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
+async-trait = "0.1"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+redis.workspace = true

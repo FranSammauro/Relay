@@ -34,6 +34,9 @@ Client --POST /jobs--> API (axum) --> PostgreSQL (fuente de verdad)
   ver su historial de ejecución, el estado agregado de la cola, qué
   workers están vivos ahora mismo, gestionar cron schedules, un dashboard
   web (`/`) y métricas en formato Prometheus (`/metrics`).
+  **Autenticación**: API key en header `Authorization: Bearer <key>`.
+  **Autorización** por rol (ver más abajo). **Rate limiting** por key
+  (ventana deslizante 60s, límites por rol, fail-open si Redis caído).
 - **Worker** hace polling de la tabla `jobs` usando
   `SELECT ... FOR UPDATE SKIP LOCKED`, lo que permite que múltiples
   workers compitan por trabajo sin bloquearse ni duplicar el claim de un
@@ -77,71 +80,85 @@ docker compose up --build
 Esto levanta PostgreSQL, Redis, la API en `:8080` y 3 workers (configurable
 con `docker compose up --build --scale worker=N`).
 
-### Probar el flujo
+## Autenticación y autorización (Fase 8)
+
+La API protege los endpoints operativos con **API keys**:
+
+- Formato: `dq_<prefijo_8_chars>_<secreto_32_bytes_base64url>` (ej.
+  `dq_a1b2c3d4_xYz123...`).
+- La key completa se muestra **una sola vez** al crearla; la base guarda
+  únicamente el prefijo (en claro) y el hash SHA-256 de la key completa.
+- Verificación en tiempo constante; revocación inmediata (`revoked_at`).
+- Roles y permisos:
+
+| Rol       | Endpoints permitidos                                                               |
+|-----------|------------------------------------------------------------------------------------|
+| producer  | `POST /jobs`, `DELETE /jobs/:id`, GET lectura (`/jobs`, `/jobs/:id`, `/stats`, `/metrics`, `/workers`) |
+| worker    | Solo lectura: `GET /jobs`, `/jobs/:id`, `/jobs/:id/attempts`, `/stats`, `/metrics`, `/workers`         |
+| admin     | Todo lo anterior + gestión de cron (`GET/POST /cron`, `GET/DELETE /cron/:id`)   |
+| público   | `/`, `/health`, `/ready` (sin key)                                                |
+
+- El dashboard web (`/`) es HTML público, pero su JavaScript pide la key y
+  la guarda en `localStorage`; los fetches internos incluyen el header
+  `Authorization: Bearer <key>`.
+
+### Crear una API key
 
 ```bash
-curl -X POST localhost:8080/jobs \
-  -H "Content-Type: application/json" \
-  -d '{"type": "resize_image", "payload": {"width": 1920, "height": 1080}}'
-
-# => {"id": "...", "status": "pending"}
-
-curl localhost:8080/jobs/<id>
-# => status pasa de pending -> running -> completed
-
-curl localhost:8080/stats
-# => {"by_status": {"pending": 0, "completed": 1, ...}}
-
-curl localhost:8080/jobs/<id>/attempts
-# => historial completo de cada intento, con worker, error y resultado
-
-curl localhost:8080/workers
-# => quién está registrado y quién está vivo ahora mismo
-
-curl localhost:8080/metrics
-# => métricas en formato Prometheus
-
-abrí http://localhost:8080/ en el navegador
-# => dashboard con queue_depth, workers y jobs recientes en vivo
-
-curl -X POST localhost:8080/cron \
-  -H "Content-Type: application/json" \
-  -d '{"name": "cleanup-diario", "cron_expr": "0 4 * * *", "type": "cleanup"}'
-# => crea el schedule, calcula next_run_at automáticamente
-
-curl localhost:8080/cron
-# => lista de cron schedules con su próxima corrida
+# La CLI habla directo con Postgres (no con la API)
+cargo run -p queue-cli -- api-key create --name "mi-servicio" --role producer
+# => creada: mi-servicio (id ...)
+# => clave (se muestra una sola vez, no se puede recuperar):
+#    dq_xyz12345_abcdefghijklmnopqrstuvwxyz1234567890ABCD
 ```
+
+La key generada se guarda en `.env` del cliente o en su gestor de secretos.
+
+### Variables de entorno (rate limiting)
+
+| Variable                          | Default | Descripción                    |
+|-----------------------------------|---------|--------------------------------|
+| `RATE_LIMIT_PRODUCER_PER_MINUTE`  | 300     | Límite para rol producer (0 = sin límite) |
+| `RATE_LIMIT_WORKER_PER_MINUTE`    | 300     | Límite para rol worker |
+| `RATE_LIMIT_ADMIN_PER_MINUTE`     | 0       | Sin límite para admin |
+
+Si se supera el límite, la API devuelve `429 Too Many Requests` con header
+`Retry-After` (segundos al próximo window). Si Redis no está disponible,
+el rate limiting se desactiva temporalmente (fail-open) — nunca 500.
 
 ### Probar la recuperación de un worker caído
 
 ```bash
 # job artificialmente lento, para tener tiempo de matar el worker que lo agarra
+KEY=$(cargo run -p queue-cli -- api-key create --name "demo" --role producer 2>&1 | grep -A1 "clave (se muestra" | tail -1 | xargs)
 curl -X POST localhost:8080/jobs \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $KEY" \
   -d '{"type": "sleep", "payload": {"seconds": 25}, "timeout_seconds": 30}'
 
 # mirá qué worker lo reclamó
-curl localhost:8080/jobs/<id> | grep worker_id
+curl -H "Authorization: Bearer $KEY" localhost:8080/jobs/<id> | grep worker_id
 
 # matalo de mala manera
 docker kill <container_del_worker_que_lo_tenia>
 
 # esperá lease_until + un ciclo de reaper (~15s por default) y mirá cómo
 # otro worker lo recupera y lo vuelve a correr
-curl localhost:8080/jobs/<id>/attempts
+curl -H "Authorization: Bearer $KEY" localhost:8080/jobs/<id>/attempts
 ```
 
 ### Probar un cron schedule
 
 ```bash
+ADMIN_KEY=$(cargo run -p queue-cli -- api-key create --name "admin" --role admin 2>&1 | grep -A1 "clave (se muestra" | tail -1 | xargs)
 curl -X POST localhost:8080/cron \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ADMIN_KEY" \
   -d '{"name": "cada-minuto", "cron_expr": "* * * * *", "type": "noop"}'
 
 # esperá un minuto y un ciclo de scheduler (~10s por default) y mirá
 # como se disparó solo
-curl localhost:8080/cron/<id>
+curl -H "Authorization: Bearer $ADMIN_KEY" localhost:8080/cron/<id>
 # => last_run_at ya tiene valor, next_run_at avanzó al próximo minuto
 ```
 
@@ -149,8 +166,10 @@ curl localhost:8080/cron/<id>
 
 ```bash
 # mandá un job lento y fijate qué worker lo agarró
+KEY=$(cargo run -p queue-cli -- api-key create --name "demo" --role producer 2>&1 | grep -A1 "clave (se muestra" | tail -1 | xargs)
 curl -X POST localhost:8080/jobs \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $KEY" \
   -d '{"type": "sleep", "payload": {"seconds": 8}, "timeout_seconds": 30}'
 
 # mandale SIGTERM (docker stop lo hace automáticamente)
@@ -168,10 +187,20 @@ docker kill --signal=TERM <container_del_worker>
 la API esté caída:
 
 ```bash
+# Jobs
 cargo run -p queue-cli -- jobs list --status dead_letter
 cargo run -p queue-cli -- jobs attempts <id>
 cargo run -p queue-cli -- stats
+
+# Cron
 cargo run -p queue-cli -- cron create --name reporte-diario --expr "0 6 * * *" --type generate_report
+
+# API Keys (Fase 8)
+cargo run -p queue-cli -- api-key create --name "mi-servicio" --role producer
+cargo run -p queue-cli -- api-key list
+cargo run -p queue-cli -- api-key revoke <prefijo>
+
+# Benchmarks
 cargo run -p queue-cli -- bench --jobs 1000 --type noop
 cargo run -p queue-cli -- --help
 ```
@@ -228,25 +257,25 @@ truncá las tablas y probá de nuevo:
 psql "$DATABASE_URL" -c "TRUNCATE jobs, job_attempts, workers, cron_schedules RESTART IDENTITY CASCADE;"
 ```
 
-## Endpoints (Fase 6)
+## Endpoints (Fase 8)
 
-| Método | Ruta                | Descripción                          |
-|--------|---------------------|---------------------------------------|
-| GET    | `/`                 | Dashboard web (HTML, live)            |
-| POST   | `/jobs`             | Crea un job                           |
-| GET    | `/jobs`             | Lista jobs (`?status=`, `?limit=`)    |
-| GET    | `/jobs/:id`         | Consulta un job                       |
-| GET    | `/jobs/:id/attempts`| Historial de intentos de un job       |
-| DELETE | `/jobs/:id`         | Cancela un job (solo si está pending) |
-| GET    | `/stats`            | Conteo de jobs por estado (`queue_depth`) |
-| GET    | `/metrics`          | Métricas en formato Prometheus        |
-| GET    | `/workers`          | Workers registrados y quién está vivo ahora |
-| POST   | `/cron`             | Crea un cron schedule                 |
-| GET    | `/cron`             | Lista cron schedules                  |
-| GET    | `/cron/:id`         | Consulta un cron schedule             |
-| DELETE | `/cron/:id`         | Elimina un cron schedule              |
-| GET    | `/health`           | Liveness                              |
-| GET    | `/ready`            | Readiness (chequea conexión a DB)     |
+| Método | Ruta                | Descripción                          | Auth / Rol                   |
+|--------|---------------------|---------------------------------------|------------------------------|
+| GET    | `/`                 | Dashboard web (HTML, live)            | Público (JS pide key)        |
+| POST   | `/jobs`             | Crea un job                           | producer, admin              |
+| GET    | `/jobs`             | Lista jobs (`?status=`, `?limit=`)    | producer, worker, admin      |
+| GET    | `/jobs/:id`         | Consulta un job                       | producer, worker, admin      |
+| GET    | `/jobs/:id/attempts`| Historial de intentos de un job       | producer, worker, admin      |
+| DELETE | `/jobs/:id`         | Cancela un job (solo si está pending) | producer, admin              |
+| GET    | `/stats`            | Conteo de jobs por estado             | producer, worker, admin      |
+| GET    | `/metrics`          | Métricas en formato Prometheus        | producer, worker, admin      |
+| GET    | `/workers`          | Workers registrados y vivos           | producer, worker, admin      |
+| POST   | `/cron`             | Crea un cron schedule                 | admin                        |
+| GET    | `/cron`             | Lista cron schedules                  | admin                        |
+| GET    | `/cron/:id`         | Consulta un cron schedule             | admin                        |
+| DELETE | `/cron/:id`         | Elimina un cron schedule              | admin                        |
+| GET    | `/health`           | Liveness                              | Público                      |
+| GET    | `/ready`            | Readiness (chequea conexión a DB)     | Público                      |
 
 Para operar sin pasar por HTTP, ver `queue-cli` más arriba.
 

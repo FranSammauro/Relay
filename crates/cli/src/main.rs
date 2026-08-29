@@ -9,7 +9,7 @@
 //! adicional, la CLI permanece operativa aunque la API esté caída, ya que
 //! no depende de ella en ningún momento.
 
-use common::{NewCronSchedule, NewJob, Storage};
+use common::{ApiKeyRole, NewCronSchedule, NewJob, Storage};
 use std::process::ExitCode;
 use uuid::Uuid;
 
@@ -54,6 +54,9 @@ async fn run(args: Vec<String>) -> anyhow::Result<()> {
         ("cron", "list") => cron_list(&storage).await,
         ("cron", "create") => cron_create(&storage, &rest).await,
         ("cron", "delete") => cron_delete(&storage, &rest).await,
+        ("api-key", "create") => api_key_create(&storage, &rest).await,
+        ("api-key", "list") => api_key_list(&storage).await,
+        ("api-key", "revoke") => api_key_revoke(&storage, &rest).await,
         ("bench", _) => {
             // "bench" no tiene subcomando propio, solo flags (--jobs, etc).
             // El parser general asume comando + subcomando + resto, así
@@ -87,6 +90,9 @@ USO:
   queue-cli cron list
   queue-cli cron create --name <name> --expr <cron-expr> --type <job-type> [--payload <json>] [--priority <n>] [--max-attempts <n>] [--timeout <seconds>]
   queue-cli cron delete <id>
+  queue-cli api-key create --name <name> --role <producer|worker|admin>
+  queue-cli api-key list
+  queue-cli api-key revoke <prefijo>
   queue-cli bench [--jobs <n>] [--type <job-type>] [--timeout-secs <n>]
 
 Variables de entorno:
@@ -274,6 +280,60 @@ async fn cron_delete(storage: &Storage, args: &[String]) -> anyhow::Result<()> {
         Ok(())
     } else {
         anyhow::bail!("cron schedule {id} no encontrado");
+    }
+}
+
+// ---- api keys (Fase 8) ---------------------------------------------------
+
+/// Genera una API key `dq_<prefijo>_<secreto>` y la persiste. La base solo
+/// guarda el prefijo y el hash SHA-256; la key completa se imprime una
+/// única vez y no se puede volver a recuperar.
+async fn api_key_create(storage: &Storage, args: &[String]) -> anyhow::Result<()> {
+    let name = flag(args, "--name").ok_or_else(|| anyhow::anyhow!("falta --name"))?;
+    let role_raw = flag(args, "--role").ok_or_else(|| anyhow::anyhow!("falta --role (producer|worker|admin)"))?;
+    let role: ApiKeyRole = role_raw
+        .parse()
+        .map_err(|_: String| anyhow::anyhow!("rol inválido: '{role_raw}' (use producer, worker o admin)"))?;
+
+    let (record, secret) = storage.create_api_key(&name, role).await?;
+
+    println!("creada: {} (id {})", record.name, record.id);
+    println!("rol: {}", record.role);
+    println!("prefijo: {}", record.key_prefix);
+    println!();
+    println!("clave (se muestra una sola vez, no se puede recuperar):");
+    println!("  {}", secret.as_str());
+    Ok(())
+}
+
+async fn api_key_list(storage: &Storage) -> anyhow::Result<()> {
+    let keys = storage.list_api_keys().await?;
+    if keys.is_empty() {
+        println!("(sin API keys)");
+        return Ok(());
+    }
+    println!("{:<36}  {:<24}  {:<12}  {:<10}  {:<20}", "ID", "NOMBRE", "PREFIJO", "ROL", "ESTADO");
+    for k in keys {
+        let estado = if k.revoked_at.is_some() { "revocada" } else { "activa" };
+        println!(
+            "{:<36}  {:<24}  {:<12}  {:<10}  {}",
+            k.id,
+            truncate(&k.name, 24),
+            k.key_prefix,
+            k.role,
+            estado
+        );
+    }
+    Ok(())
+}
+
+async fn api_key_revoke(storage: &Storage, args: &[String]) -> anyhow::Result<()> {
+    let prefix = positional(args).ok_or_else(|| anyhow::anyhow!("falta el prefijo de la API key"))?;
+    if storage.revoke_api_key_by_prefix(prefix).await? {
+        println!("API key con prefijo '{prefix}' revocada");
+        Ok(())
+    } else {
+        anyhow::bail!("no se encontró ninguna API key activa con prefijo '{prefix}'");
     }
 }
 

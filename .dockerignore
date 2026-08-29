@@ -1,0 +1,36 @@
+# Build artifacts
+target/
+**/target/
+
+# Git
+.git/
+.gitignore
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Stale tracked copy (no tocar, no copiar al build)
+distributed-queue/
+
+# Env files (no copiar secretos reales)
+.env
+.env.local
+.env.*.local
+
+# Cargo lock is needed for reproducible builds, but can be regenerated
+# Cargo.lock
+
+# Test artifacts
+*.profraw
+*.profdata
+coverage/
+
+# Docker
+docker-compose.override.yml

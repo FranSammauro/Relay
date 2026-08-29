@@ -1,0 +1,96 @@
+# Release workflow: build Docker images, push to ghcr.io, create GitHub Release.
+# Disparado por tags `v*` (ej. `git tag v0.8.0 && git push origin v0.8.0`).
+#
+# - Usa rustc apt (viejo) coherente con CI y Cargo.toml pines.
+# - cargo audit con binario precompilado (no compilar con toolchain viejo).
+# - Solo amd64 (sin multi-arch).
+# - Imágenes: ghcr.io/${{ github.repository }}-api y -worker con tag = versión sin `v` + `latest`.
+#
+# Requiere: `GITHUB_TOKEN` (proporcionado por GitHub) y permisos `packages: write`.
+# Ver Settings > Actions > General > Workflow permissions.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write      # para gh release create
+  packages: write      # para push a ghcr.io
+  attestations: write  # opcional, para SLSA/provenance si se habilita
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # para que `git describe` funcione si se usa
+
+      # Extraer versión del tag (quitar `v` inicial)
+      - name: Obtener versión
+        id: version
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          VERSION=${TAG#v}
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      # Login a ghcr.io
+      - name: Login a ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build y push imagen API
+      - name: Build y push API
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.api
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}-api:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository }}-api:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Build y push imagen Worker
+      - name: Build y push Worker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.worker
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}-worker:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository }}-worker:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # cargo audit con binario precompilado (evita compilar con rustc viejo)
+      - name: Cargo audit
+        run: |
+          # Instalar binario precompilado de cargo-audit
+          curl -LsSf https://github.com/RustSec/cargo-audit/releases/latest/download/cargo-audit-x86_64-unknown-linux-gnu.tar.gz | tar xz -C /tmp
+          /tmp/cargo-audit audit --json > /tmp/audit.json || true
+          # Mostrar resumen (no fallar el build por avisos de RUSTSEC)
+          cat /tmp/audit.json | jq -r '.vulnerabilities.found // 0' | xargs -I {} echo "Vulnerabilidades encontradas: {}"
+
+      # Crear GitHub Release con notas generadas
+      - name: Crear GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: Release ${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          files: |
+            # No hay artifacts binarios extra (las imágenes están en ghcr.io)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

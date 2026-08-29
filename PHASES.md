@@ -57,10 +57,13 @@
 - [x] Análisis de cuellos de botella — ver `docs/performance.md` para el informe completo con metodología y datos reales
 - [x] Hallazgo real documentado: `claim_next_job` bajo backlog sostenido con `status IN (...)` materializa todas las filas candidatas antes de ordenar (hasta 170x más lento que la variante de un solo status en el escenario sintético de 20k filas pending); optimización identificada y documentada, pendiente de decisión deliberada por el trade-off de prioridad entre `pending` y `retry_scheduled` que introduce
 
-## ⬜ Fase 8 — Production Polish
-- [ ] Autenticación (API keys) y autorización (producer/worker/admin)
-- [ ] Rate limiting
-- [ ] CI extendido (build + push de imágenes Docker, releases) — el compile+test básico ya corre desde Fase 2
-- [ ] Tests de integración y de fallos
-- [ ] Threat model
-- [ ] Documentación final y ADRs restantes
+## ✅ Fase 8 — Production Polish
+- [x] Autenticación por API keys (`dq_<prefijo>_<secreto>`) con hash SHA-256, lookup por prefijo, verificación en tiempo constante
+- [x] Autorización por rol (producer/worker/admin) con tabla de grants por (método, ruta) — sin guardas por sub-router (evita bug de merge en axum 0.7)
+- [x] Rate limiting sliding window en Redis (60s), límites por rol configurables por env, fail-open si Redis caído, `Retry-After` en 429
+- [x] CI extendido (workflow `release.yml`: build + push a ghcr.io en tags `v*`, cargo audit con binario precompilado, GitHub Release)
+- [x] Tests de integración: `common/tests/api_keys.rs`, `api/tests/{support,auth,ratelimit}.rs`
+- [x] ADR-007 (API keys), ADR-008 (rate limiting)
+- [x] Documentación: README actualizados, `.env.example` + `docker-compose.yml` con `RATE_LIMIT_*`, `.dockerignore`
+- [x] Dashboard con prompt de API key (localStorage) y `Authorization: Bearer` en fetches
+- [x] CLI: `queue-cli api-key create|list|revoke`
