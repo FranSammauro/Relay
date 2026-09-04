@@ -1,7 +1,7 @@
 # Informe de rendimiento
 
 Fase 7. Todos los números de este informe provienen de corridas reales
-contra PostgreSQL 16 y Redis 7, ejecutadas con `queue-cli bench` y con
+contra PostgreSQL 16 y Redis 7, ejecutadas con `relay-cli bench` y con
 `EXPLAIN ANALYZE` directo sobre la base. No hay estimaciones ni cifras de
 marketing: cada tabla incluye la metodología exacta para que cualquiera
 pueda reproducirla.
@@ -19,7 +19,7 @@ decisión de diseño de las fases anteriores.
 
 ## Metodología
 
-`queue-cli bench --jobs N --type <tipo> --timeout-secs S`:
+`relay-cli bench --jobs N --type <tipo> --timeout-secs S`:
 
 1. Crea N jobs de forma secuencial vía `Storage::create_job`, midiendo el
    tiempo de cada llamada individual (latencia de "envío").
@@ -35,13 +35,14 @@ decisión de diseño de las fases anteriores.
    - **Ejecución**: `completed_at - started_at`. Cuánto tardó el handler.
    - **Total**: `completed_at - created_at`.
 
-Aclaración importante sobre "latencia de envío": como `queue-cli` habla
-directo con PostgreSQL (ver decisión de diseño en Fase 6), lo que mide es
-el costo de un `INSERT` en la tabla `jobs`, no una request HTTP completa
-contra la API. Quien envíe jobs vía `POST /jobs` va a ver, además de este
-costo, el overhead de axum, serialización JSON y la vuelta de red — del
-orden de un dígito de milisegundos adicionales en un despliegue típico,
-pero no medido específicamente en este informe.
+Aclaración importante sobre la latencia de envío: como `relay-cli` habla
+directo con PostgreSQL, sin pasar por la API, lo que mide es el costo de
+un `INSERT` en la tabla `jobs`, no el de una solicitud HTTP completa.
+Quien envíe jobs mediante `POST /jobs` va a experimentar, además de este
+costo, el tiempo de la capa HTTP de axum, la serialización JSON, la
+verificación de la API key y la evaluación del límite de tasa, del orden
+de unos pocos milisegundos adicionales en un despliegue típico, aunque no
+medidos específicamente en este informe.
 
 Todas las corridas usaron jobs de tipo `noop` (el handler más liviano
 disponible, sin trabajo real), precisamente para que la latencia de cola y
@@ -51,7 +52,7 @@ handler de negocio arbitrario.
 ## Resultado 1: carga moderada, un worker
 
 ```
-queue-cli bench --jobs 300 --type noop --timeout-secs 60
+relay-cli bench --jobs 300 --type noop --timeout-secs 60
 ```
 
 Worker único, `CONCURRENCY=8`.
@@ -73,7 +74,7 @@ límite de 8 ejecuciones concurrentes.
 ## Resultado 2: carga sostenida, un worker vs. dos workers
 
 ```
-queue-cli bench --jobs 1000 --type noop --timeout-secs 60
+relay-cli bench --jobs 1000 --type noop --timeout-secs 60
 ```
 
 | Escenario           | Cola p50 | Cola p95 | Cola p99 | Total p50 | Total p99 |
@@ -223,7 +224,7 @@ o cachear el resultado por un intervalo corto. No es necesario hoy.
 ```bash
 docker compose up -d postgres redis
 cargo run -p worker &                       # un worker
-cargo run -p queue-cli -- bench --jobs 1000 --type noop --timeout-secs 60
+cargo run -p relay-cli -- bench --jobs 1000 --type noop --timeout-secs 60
 
 # para el análisis de índices bajo backlog real:
 psql "$DATABASE_URL" -c "

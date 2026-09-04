@@ -78,22 +78,22 @@ async fn run(args: Vec<String>) -> anyhow::Result<()> {
 
 fn print_help() {
     println!(
-        r#"queue-cli: operación directa sobre el distributed job queue (se comunica con PostgreSQL, no con la API)
+        r#"relay-cli: operación directa sobre el motor de colas distribuidas Relay (se comunica con PostgreSQL, no con la API)
 
 USO:
-  queue-cli jobs list [--status <status>] [--limit <n>]
-  queue-cli jobs get <id>
-  queue-cli jobs attempts <id>
-  queue-cli jobs cancel <id>
-  queue-cli stats
-  queue-cli workers
-  queue-cli cron list
-  queue-cli cron create --name <name> --expr <cron-expr> --type <job-type> [--payload <json>] [--priority <n>] [--max-attempts <n>] [--timeout <seconds>]
-  queue-cli cron delete <id>
-  queue-cli api-key create --name <name> --role <producer|worker|admin>
-  queue-cli api-key list
-  queue-cli api-key revoke <prefijo>
-  queue-cli bench [--jobs <n>] [--type <job-type>] [--timeout-secs <n>]
+  relay-cli jobs list [--status <status>] [--limit <n>]
+  relay-cli jobs get <id>
+  relay-cli jobs attempts <id>
+  relay-cli jobs cancel <id>
+  relay-cli stats
+  relay-cli workers
+  relay-cli cron list
+  relay-cli cron create --name <name> --expr <cron-expr> --type <job-type> [--payload <json>] [--priority <n>] [--max-attempts <n>] [--timeout <seconds>]
+  relay-cli cron delete <id>
+  relay-cli api-key create --name <name> --role <producer|worker|admin>
+  relay-cli api-key list
+  relay-cli api-key revoke <prefijo>
+  relay-cli bench [--jobs <n>] [--type <job-type>] [--timeout-secs <n>]
 
 Variables de entorno:
   DATABASE_URL   default: postgres://queue:queue@localhost:5432/queue

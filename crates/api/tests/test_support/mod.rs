@@ -1,11 +1,21 @@
 //! Utilidades compartidas para tests de integración de la API (requiere
 //! Postgres y Redis corriendo).
+//!
+//! Cada archivo de tests de integración (auth.rs, ratelimit.rs) se compila
+//! como un binario independiente, y este módulo se incluye por separado en
+//! cada uno. Como consecuencia, una función usada solo desde uno de los
+//! dos archivos genera una advertencia de código sin uso al compilar el
+//! otro binario, aunque el conjunto completo esté en uso. Por eso las
+//! funciones de este módulo llevan `#[allow(dead_code)]`: no indica código
+//! muerto real, sino una consecuencia esperada del modelo de compilación
+//! de los tests de integración en Rust.
 
 use common::{Storage, Heartbeats, RateLimiter, RateLimits};
 use std::env;
 
 /// Intenta conectar a Postgres; si no hay `DATABASE_URL` o falla la
 /// conexión, devuelve `None` (el test se salta imprimiendo aviso).
+#[allow(dead_code)]
 pub async fn pg_connect_or_skip() -> Option<Storage> {
     let url = env::var("DATABASE_URL").ok()?;
     match Storage::connect(&url).await {
@@ -21,6 +31,7 @@ pub async fn pg_connect_or_skip() -> Option<Storage> {
 }
 
 /// Intenta conectar a Redis; `None` si no hay `REDIS_URL` o falla.
+#[allow(dead_code)]
 pub async fn redis_connect_or_skip() -> Option<redis::aio::ConnectionManager> {
     let url = env::var("REDIS_URL").ok()?;
     let client = redis::Client::open(url).ok()?;
@@ -30,6 +41,7 @@ pub async fn redis_connect_or_skip() -> Option<redis::aio::ConnectionManager> {
 
 
 /// Limpia las claves de rate limiting para un `key_id` (útil entre tests).
+#[allow(dead_code)]
 pub async fn cleanup_ratelimit(key_id: &uuid::Uuid, conn: &mut redis::aio::ConnectionManager) {
     let pattern = format!("ratelimit:{key_id}:*");
     let mut cursor = 0u64;

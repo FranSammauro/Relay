@@ -2,7 +2,7 @@
 
 use api::app;
 mod test_support;
-use test_support::{cleanup_ratelimit, create_test_key, pg_connect_or_skip, redis_connect_or_skip, test_app_state};
+use test_support::{cleanup_ratelimit, create_test_key, redis_connect_or_skip, test_app_state};
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use tower::ServiceExt;

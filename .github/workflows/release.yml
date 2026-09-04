@@ -90,7 +90,5 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: false
-          files: |
-            # No hay artifacts binarios extra (las imágenes están en ghcr.io)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

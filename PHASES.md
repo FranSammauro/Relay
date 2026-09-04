@@ -25,7 +25,7 @@
 - [x] Timeouts por job (`timeout_seconds`, default 30s, `tokio::time::timeout` alrededor del handler)
 - [x] Tabla `job_attempts` (historial completo por intento: worker, inicio, fin, resultado, error)
 - [x] `GET /jobs/:id/attempts` para consultar el historial
-- [x] Tests de integración contra Postgres real: retry → retry → dead_letter, y attempt exitoso
+- [x] Tests de integración contra Postgres real: retry -> retry -> dead_letter, y attempt exitoso
 
 ## ✅ Fase 4 — Distributed Failure Recovery
 - [x] Heartbeats de worker (Redis, TTL = 3x `HEARTBEAT_INTERVAL_MS`, ver ADR-002)
@@ -47,12 +47,12 @@
 ## ✅ Fase 6 — Operational Features
 - [x] Métricas Prometheus (`GET /metrics`, calculadas al vuelo desde Postgres — sin contadores en memoria de proceso, `job_attempts` como `_total`, percentiles de duración vía `percentile_cont` de SQL)
 - [x] Dashboard web (`GET /`, HTML+JS estático sin build step ni dependencias nuevas, polling cada 4s sobre los endpoints existentes)
-- [x] CLI (`queue-cli`, nuevo binario del workspace, habla directo con Postgres via `common::Storage`, parsing de argumentos a mano sin `clap`)
+- [x] CLI (`relay-cli`, nuevo binario del workspace, habla directo con Postgres via `common::Storage`, parsing de argumentos a mano sin `clap`)
 - [x] Graceful shutdown (SIGTERM/Ctrl+C compartido en `common::shutdown`; API drena requests en vuelo, worker deja de reclamar y espera a que terminen los jobs en curso con un plazo de `SHUTDOWN_GRACE_SECONDS` antes de salir, y limpia su heartbeat de Redis al bajar)
 - [x] Validado manualmente de punta a punta: SIGTERM real a mitad de un job de 8s — el worker esperó a que terminara completo antes de cerrar
 
 ## ✅ Fase 7 — Performance
-- [x] Benchmarks reproducibles (`queue-cli bench`, mide latencia de envío/cola/ejecución con datos reales, no estimados)
+- [x] Benchmarks reproducibles (`relay-cli bench`, mide latencia de envío/cola/ejecución con datos reales, no estimados)
 - [x] Profiling de índices (`EXPLAIN ANALYZE` sobre claim_next_job, reap_expired_leases y count_by_status)
 - [x] Análisis de cuellos de botella — ver `docs/performance.md` para el informe completo con metodología y datos reales
 - [x] Hallazgo real documentado: `claim_next_job` bajo backlog sostenido con `status IN (...)` materializa todas las filas candidatas antes de ordenar (hasta 170x más lento que la variante de un solo status en el escenario sintético de 20k filas pending); optimización identificada y documentada, pendiente de decisión deliberada por el trade-off de prioridad entre `pending` y `retry_scheduled` que introduce
@@ -66,4 +66,10 @@
 - [x] ADR-007 (API keys), ADR-008 (rate limiting)
 - [x] Documentación: README actualizados, `.env.example` + `docker-compose.yml` con `RATE_LIMIT_*`, `.dockerignore`
 - [x] Dashboard con prompt de API key (localStorage) y `Authorization: Bearer` en fetches
-- [x] CLI: `queue-cli api-key create|list|revoke`
+- [x] CLI: `relay-cli api-key create|list|revoke`
+
+---
+
+Con las ocho fases completas, el proyecto llegó a su primera versión
+estable, v1.0.0. El detalle de esta versión está en
+[`CHANGELOG.md`](./CHANGELOG.md).

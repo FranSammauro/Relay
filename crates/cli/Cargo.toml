@@ -1,10 +1,10 @@
 [package]
-name = "queue-cli"
+name = "relay-cli"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "queue-cli"
+name = "relay-cli"
 path = "src/main.rs"
 
 [dependencies]

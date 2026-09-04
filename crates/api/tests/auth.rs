@@ -2,7 +2,7 @@
 
 use api::app;
 mod test_support;
-use test_support::{cleanup_ratelimit, create_test_key, pg_connect_or_skip, redis_connect_or_skip, test_app_state};
+use test_support::{create_test_key, test_app_state};
 use axum::{body::Body, http::{Method, Request, StatusCode, header}, Router};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -78,19 +78,19 @@ async fn auth_producer_can_read_and_write() {
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK, "producer GET /jobs");
 
-    // POST /jobs (write)
+    // POST /jobs (creación)
     let req = Request::builder()
         .method(Method::POST)
         .uri("/jobs")
         .header(header::AUTHORIZATION, format!("Bearer {}", prod_key))
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"job_type":"test","payload":{}}"#)).unwrap();
+        .body(Body::from(r#"{"type":"test","payload":{}}"#)).unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK, "producer POST /jobs");
+    assert_eq!(res.status(), StatusCode::CREATED, "producer POST /jobs");
 
-    // DELETE /jobs/:id (write) - need a valid job id; create first
-    // First list to get a job, or just test that the route exists (404 is fine if no such job)
-    // We'll skip the actual delete for brevity; route tested by authorization matrix.
+    // La cancelación (DELETE /jobs/:id) queda cubierta por la matriz de
+    // autorización general; no se ejecuta acá para no depender de crear
+    // primero un job y conocer su id.
 
     // GET /stats, /metrics, /workers (read)
     for path in ["/stats", "/metrics", "/workers"] {
@@ -117,13 +117,13 @@ async fn auth_worker_can_read_but_not_write() {
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK, "worker GET /jobs");
 
-    // POST /jobs (write) -> 403
+    // POST /jobs (escritura, prohibido para worker) -> 403
     let req = Request::builder()
         .method(Method::POST)
         .uri("/jobs")
         .header(header::AUTHORIZATION, format!("Bearer {}", worker_key))
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"job_type":"test","payload":{}}"#)).unwrap();
+        .body(Body::from(r#"{"type":"test","payload":{}}"#)).unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::FORBIDDEN, "worker POST /jobs forbidden");
 
@@ -163,15 +163,15 @@ async fn auth_admin_can_access_cron() {
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK, "admin GET /cron");
 
-    // POST /cron -> OK
+    // POST /cron -> Created
     let req = Request::builder()
         .method(Method::POST)
         .uri("/cron")
         .header(header::AUTHORIZATION, format!("Bearer {}", admin_key))
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"name":"t","cron_expr":"* * * * *","job_type":"t","payload":{}}"#)).unwrap();
+        .body(Body::from(r#"{"name":"t","cron_expr":"* * * * *","type":"t","payload":{}}"#)).unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::OK, "admin POST /cron");
+    assert_eq!(res.status(), StatusCode::CREATED, "admin POST /cron");
 }
 
 #[tokio::test]

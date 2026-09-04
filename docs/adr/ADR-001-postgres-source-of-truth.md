@@ -13,7 +13,7 @@ perder información crítica (payload, estado, intentos, errores).
 PostgreSQL es la única fuente de verdad para el estado persistente de los
 jobs. Cualquier componente de coordinación efímera (Redis, a partir de
 Fase 4) solo maneja información que, si se pierde, no compromete la
-correctitud del sistema — únicamente su performance o velocidad de
+correctitud del sistema, únicamente su rendimiento o velocidad de
 coordinación.
 
 Regla general: *si perder Redis implica perder información crítica sobre

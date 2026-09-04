@@ -24,10 +24,14 @@ async fn api_key_secret_not_recoverable_from_db() {
     let (record, _secret) = storage.create_api_key("test-key", common::ApiKeyRole::Producer).await
         .expect("create api key");
 
-    // El secreto completo NO está en la DB, solo el hash.
+    // El secreto completo NO está en la DB, solo el hash. El prefijo
+    // persistido son los 8 caracteres alfanuméricos generados por
+    // generate(), sin el marcador "dq_" (ver ApiKeySecret::prefix() en
+    // common::api_keys): el marcador identifica el formato de la key
+    // completa, no forma parte del prefijo que se guarda ni por el que se
+    // busca en la base.
     assert!(!record.key_prefix.is_empty());
-    assert!(record.key_prefix.starts_with("dq_"));
-    assert!(record.key_prefix.len() > 3); // dq_ + 8 chars
+    assert_eq!(record.key_prefix.len(), 8);
 
     // El hash no permite recuperar el secreto.
     // ApiKeyRecord no tiene key_hash (es privado en StoredApiKey); solo ApiKeySecret.hash() lo da.
@@ -71,17 +75,24 @@ async fn api_key_revoke() {
         .expect("found");
     assert!(found.revoked_at.is_none());
 
-    // Revocar
+    // Revocar.
     let revoked = storage.revoke_api_key_by_prefix(&record.key_prefix).await
         .expect("revoke");
     assert!(revoked);
 
-    // Ya no debe encontrarse como activa (el método filtra revocadas)
+    // find_api_key_by_prefix devuelve la fila igual, revocada o no: el
+    // filtrado de revocadas es responsabilidad de quien llama (el
+    // extractor de autenticación en crates/api/src/auth.rs), no de esta
+    // consulta. Esto es deliberado: permite distinguir en el caller entre
+    // "no existe" y "existe pero está revocada" sin tener que hacer una
+    // segunda consulta, y ambos casos terminan devolviendo el mismo 401
+    // hacia afuera para no filtrar información sobre cuál fue el motivo.
     let found_after = storage.find_api_key_by_prefix(&record.key_prefix).await
-        .expect("lookup after revoke");
-    assert!(found_after.is_none());
+        .expect("lookup after revoke")
+        .expect("la fila debería seguir encontrándose, ahora marcada como revocada");
+    assert!(found_after.revoked_at.is_some());
 
-    // Listar debe devolver la key (el listado sí muestra revocadas)
+    // Listar también debe devolver la key con su marca de revocación.
     let all = storage.list_api_keys().await.expect("list");
     let listed = all.iter().find(|k| k.key_prefix == record.key_prefix).expect("listed");
     assert!(listed.revoked_at.is_some());
